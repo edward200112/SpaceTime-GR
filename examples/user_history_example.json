@@ -1,0 +1,20 @@
+[
+  {
+    "business_id": "example_business_1",
+    "name": "Starbucks Coffee",
+    "timestamp": 1609459200,
+    "note": "This is an example. Replace with actual business_ids from your Yelp dataset"
+  },
+  {
+    "business_id": "example_business_2",
+    "name": "AMC Cinema",
+    "timestamp": 1609545600,
+    "note": "User visited this place after Starbucks"
+  },
+  {
+    "business_id": "example_business_3",
+    "name": "Chipotle Mexican Grill",
+    "timestamp": 1609632000,
+    "note": "Recent visit"
+  }
+]

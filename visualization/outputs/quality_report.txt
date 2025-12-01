@@ -1,0 +1,41 @@
+============================================================
+RQ-VAE Codebook Quality Report
+============================================================
+
+Layer 0:
+  Total Codes: 64
+  Used Codes: 64 (100.00%)
+  Average Frequency: 2349.16 ± 1387.12
+  Most Common: [(44, 7134), (54, 6721), (61, 5499)]
+  Least Common: [(15, 922), (33, 896), (62, 887)]
+
+Layer 1:
+  Total Codes: 64
+  Used Codes: 64 (100.00%)
+  Average Frequency: 2349.16 ± 1171.19
+  Most Common: [(13, 5837), (46, 5380), (19, 5112)]
+  Least Common: [(30, 706), (58, 670), (4, 411)]
+
+Layer 2:
+  Total Codes: 64
+  Used Codes: 64 (100.00%)
+  Average Frequency: 2349.16 ± 646.55
+  Most Common: [(25, 3648), (50, 3605), (14, 3584)]
+  Least Common: [(51, 1294), (59, 1188), (2, 1058)]
+
+Collision Analysis:
+  Total Items: 150346
+  Unique SIDs: 57300
+  Collision Rate: 61.8879%
+
+Cluster Analysis:
+  Total Clusters: 3954
+  Average Items per Cluster: 38.02
+  Top 5 Largest Clusters:
+    Cluster 54-19: 790 items
+    Cluster 54-13: 783 items
+    Cluster 61-46: 707 items
+    Cluster 61-2: 625 items
+    Cluster 42-13: 542 items
+
+============================================================
