@@ -1,11 +1,10 @@
 """
-LLM Training Script for HierGR-SeqRec
+Step 5: SFT Training (Supervised Fine-Tuning) - Fixed for Labels
 
-Support for:
-- LoRA fine-tuning
-- Full fine-tuning
-- DeepSpeed (optional)
-- Multi-task training (Task A/B/C)
+修复点：
+1. [Critical] process_data 中显式生成 'labels'，解决 ValueError: model did not return a loss。
+2. [Critical] 添加 enable_input_require_grads()，解决 LoRA + Gradient Checkpointing 的兼容性问题。
+3. 优化 DataCollator 配置。
 """
 
 import os
@@ -19,11 +18,11 @@ from transformers import (
     AutoTokenizer,
     TrainingArguments,
     Trainer,
-    DataCollatorForLanguageModeling
+    DataCollatorForSeq2Seq,
+    BitsAndBytesConfig
 )
-from peft import LoraConfig, get_peft_model, TaskType, PeftModel
-from dataset import prepare_datasets, DataCollatorForPromptDataset
-
+from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
+from datasets import load_dataset
 
 def setup_logging():
     logging.basicConfig(
@@ -33,299 +32,191 @@ def setup_logging():
     )
     return logging.getLogger(__name__)
 
-
-def load_sid_tokens(config, logger):
-    """Load all unique Cluster IDs (SIDs) from sid_mapping.json"""
-    data_config = config['data']
-    processed_dir = data_config['processed_dir']
-    mapping_file = os.path.join(processed_dir, data_config['sid_mapping_file'])
-    
-    if not os.path.exists(mapping_file):
-        logger.warning(f"SID mapping file not found: {mapping_file}")
-        return []
-    
-    logger.info(f"Loading SID tokens from {mapping_file}")
-    
-    with open(mapping_file, 'r', encoding='utf-8') as f:
-        sid_mapping = json.load(f)
-    
-    # Extract all unique cluster_str tokens
-    unique_tokens = set()
-    for item_data in sid_mapping.values():
-        cluster_str = item_data['cluster_str']  # Format: "<0, 12>"
-        unique_tokens.add(cluster_str)
-    
-    sid_tokens = sorted(list(unique_tokens))
-    logger.info(f"Found {len(sid_tokens)} unique SID tokens")
-    logger.info(f"Example SID tokens: {sid_tokens[:5]}")
-    
-    return sid_tokens
-
-
-def load_model_and_tokenizer(config, logger):
-    """Load base model and tokenizer"""
-    llm_config = config['llm']
-    model_name = llm_config['model_name']
-    
-    logger.info(f"Loading model: {model_name}")
-    
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        trust_remote_code=True,
-        padding_side='right'
-    )
-    
-    # Set pad token
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    # Record original vocab size
-    original_vocab_size = len(tokenizer)
-    logger.info(f"Original vocabulary size: {original_vocab_size}")
-    
-    # Load and add SID tokens to vocabulary
-    sid_tokens = load_sid_tokens(config, logger)
-    if sid_tokens:
-        logger.info(f"Adding {len(sid_tokens)} SID tokens to tokenizer...")
-        num_added = tokenizer.add_tokens(sid_tokens)
-        logger.info(f"Successfully added {num_added} new tokens to vocabulary")
-        logger.info(f"New vocabulary size: {len(tokenizer)}")
-    else:
-        logger.warning("No SID tokens found. Model will use subword tokenization for SIDs.")
-    
-    # Load model with Flash Attention 2 for acceleration
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16 if llm_config['bf16'] else torch.float16,
-            device_map='auto',
-            attn_implementation="flash_attention_2",  # Enable Flash Attention 2
-            use_cache=False  # Disable cache for training (required by gradient checkpointing)
-        )
-        logger.info("Flash Attention 2 enabled successfully")
-    except Exception as e:
-        logger.warning(f"Flash Attention 2 not available: {e}")
-        logger.info("Falling back to standard attention")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16 if llm_config['bf16'] else torch.float16,
-            device_map='auto',
-            use_cache=False  # Disable cache for training
-        )
-    
-    # Resize embeddings to match new vocabulary size
-    if len(tokenizer) > original_vocab_size:
-        logger.info(f"Resizing model embeddings from {original_vocab_size} to {len(tokenizer)}")
-        model.resize_token_embeddings(len(tokenizer))
-        logger.info("Model embeddings resized successfully")
-    
-    logger.info(f"Model configuration: {model.config}")
-    logger.info(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    return model, tokenizer, original_vocab_size
-
-
-def setup_lora(model, config, logger, original_vocab_size=None):
-    """Setup LoRA for efficient fine-tuning"""
-    llm_config = config['llm']
-    
-    if not llm_config['use_lora']:
-        logger.info("LoRA disabled, using full fine-tuning")
-        return model
-    
-    logger.info("Setting up LoRA...")
-    
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=llm_config['lora_r'],
-        lora_alpha=llm_config['lora_alpha'],
-        lora_dropout=llm_config['lora_dropout'],
-        target_modules=llm_config['target_modules'],
-        inference_mode=False,
-        modules_to_save=["embed_tokens", "lm_head"]  # 确保 embedding 和 lm_head 可训练
-    )
-    
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
-    
-    # 如果添加了新 token，确保新的 embedding 参数可训练
-    if original_vocab_size is not None:
-        embedding_layer = model.get_input_embeddings()
-        if hasattr(embedding_layer, 'original_module'):
-            embedding_layer = embedding_layer.original_module
+class SFTTrainer:
+    def __init__(self, config_path='./config/config.yaml'):
+        with open(config_path, 'r', encoding='utf-8') as f:
+            self.config = yaml.safe_load(f)
         
-        current_vocab_size = embedding_layer.weight.shape[0]
-        if current_vocab_size > original_vocab_size:
-            logger.info(f"Ensuring new token embeddings ({original_vocab_size} -> {current_vocab_size}) are trainable")
-            # 新增的 embedding 参数已经通过 modules_to_save 设置为可训练
-    
-    return model
+        self.logger = setup_logging()
+        self.data_conf = self.config['data']
+        self.llm_conf = self.config['llm']
+        
+        self.output_dir = self.data_conf['llm_ckpt_dir']
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+    def load_model_and_tokenizer(self):
+        model_name = self.llm_conf['model_name']
+        self.logger.info(f"Loading model: {model_name}")
+        
+        # 1. Tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            padding_side='right'
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+        # 2. Model
+        bnb_config = None
+        if self.llm_conf.get('use_4bit', False):
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16
+            )
+            
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16 if self.llm_conf['bf16'] else torch.float16,
+            device_map='auto',
+            use_cache=False, 
+            attn_implementation="flash_attention_2" if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else "eager"
+        )
+        
+        # 3. LoRA Setup
+        if self.llm_conf['use_lora']:
+            self.logger.info("Setting up LoRA...")
+            
+            # [Fix 2] 开启 Gradient Checkpointing 时必须开启 input_require_grads
+            if self.llm_conf['gradient_checkpointing']:
+                self.model.gradient_checkpointing_enable()
+                # 这一步对于 LoRA 训练至关重要，否则 loss 无法反传
+                if hasattr(self.model, "enable_input_require_grads"):
+                    self.model.enable_input_require_grads()
+                
+            self.model = prepare_model_for_kbit_training(self.model)
+            
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                inference_mode=False,
+                r=self.llm_conf['lora_r'],
+                lora_alpha=self.llm_conf['lora_alpha'],
+                lora_dropout=self.llm_conf['lora_dropout'],
+                target_modules=self.llm_conf['target_modules']
+            )
+            self.model = get_peft_model(self.model, peft_config)
+            self.model.print_trainable_parameters()
+            
+    def process_data(self):
+        self.logger.info("Processing Datasets...")
+        
+        train_file = os.path.join(self.data_conf['processed_dir'], self.data_conf['train_prompts_file'])
+        valid_file = os.path.join(self.data_conf['processed_dir'], self.data_conf['valid_prompts_file'])
+        
+        dataset = load_dataset('json', data_files={'train': train_file, 'validation': valid_file})
+        
+        def format_prompt(sample):
+            instruction = sample['instruction']
+            messages = [
+                {"role": "user", "content": instruction},
+                {"role": "assistant", "content": sample['output']}
+            ]
+            full_text = self.tokenizer.apply_chat_template(messages, tokenize=False)
+            return {"text": full_text}
 
+        dataset = dataset.map(format_prompt)
+        
+        def tokenize_function(examples):
+            # Tokenize
+            model_inputs = self.tokenizer(
+                examples["text"],
+                truncation=True,
+                max_length=self.llm_conf['max_seq_length'],
+                padding=False 
+            )
+            
+            # [Fix 1] 显式创建 labels
+            # 对于 Causal LM，labels 就是 input_ids。
+            # 模型内部会自动将 labels 向左移动一位来计算 next-token prediction loss。
+            model_inputs["labels"] = model_inputs["input_ids"].copy()
+            
+            return model_inputs
+        
+        tokenized_datasets = dataset.map(
+            tokenize_function, 
+            batched=True, 
+            remove_columns=dataset['train'].column_names 
+        )
+        
+        self.train_dataset = tokenized_datasets['train']
+        self.eval_dataset = tokenized_datasets['validation'].select(range(min(1000, len(tokenized_datasets['validation']))))
 
-def setup_training_args(config, output_dir):
-    """Setup training arguments"""
-    llm_config = config['llm']
-    hardware_config = config['hardware']
-    
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        num_train_epochs=llm_config['epochs'],
-        per_device_train_batch_size=llm_config['batch_size'],
-        per_device_eval_batch_size=llm_config['batch_size'],
-        gradient_accumulation_steps=llm_config['gradient_accumulation_steps'],
-        learning_rate=llm_config['lr'],
-        weight_decay=llm_config['weight_decay'],
-        warmup_ratio=llm_config['warmup_ratio'],
-        lr_scheduler_type=llm_config['lr_scheduler'],
-        logging_steps=config['logging']['log_interval'],
-        save_steps=config['logging']['save_interval'],
-        eval_strategy="steps",
-        eval_steps=config['logging']['save_interval'],
-        save_strategy="steps",  # 按步数保存
-        save_total_limit=3,  # 只保留1个最佳checkpoint
-        load_best_model_at_end=True,  # 训练结束时加载最佳模型
-        metric_for_best_model="eval_loss",  # 以eval_loss作为最佳模型的评判标准
-        greater_is_better=False,  # eval_loss越小越好
-        save_only_model=False,  # 保存完整checkpoint（包含optimizer状态，便于恢复训练）
-        fp16=llm_config['fp16'],
-        bf16=llm_config['bf16'],
-        gradient_checkpointing=llm_config['gradient_checkpointing'],
-        optim=llm_config['optimizer'],
-        report_to="none",  # Can change to "wandb" if needed
-        seed=hardware_config['seed'],
-        dataloader_num_workers=hardware_config['num_workers'],
-        dataloader_pin_memory=hardware_config['pin_memory'],
-        remove_unused_columns=False
-    )
-    
-    # DeepSpeed config (optional)
-    if llm_config.get('use_deepspeed', False):
-        training_args.deepspeed = llm_config['deepspeed_config']
-    
-    return training_args
+        
+        self.logger.info(f"Train Size: {len(self.train_dataset)}")
+        self.logger.info(f"Eval Size: {len(self.eval_dataset)}")
+        
+        # 打印一个样本检查 labels 是否存在
+        self.logger.info(f"Sample keys: {self.train_dataset[0].keys()}")
 
+    def train(self):
+        self.logger.info("Starting Training...")
+        
+        training_args = TrainingArguments(
+            output_dir=self.output_dir,
+            num_train_epochs=self.llm_conf['epochs'],
+            per_device_train_batch_size=self.llm_conf['batch_size'],
+            per_device_eval_batch_size=self.llm_conf['batch_size'],
+            gradient_accumulation_steps=self.llm_conf['gradient_accumulation_steps'],
+            learning_rate=float(self.llm_conf['lr']),
+            weight_decay=self.llm_conf['weight_decay'],
+            warmup_ratio=self.llm_conf['warmup_ratio'],
+            lr_scheduler_type=self.llm_conf['lr_scheduler'],
+            logging_steps=10,
+            
+            # 使用 eval_strategy (新版 transformers)
+            eval_strategy="steps", 
+            eval_steps=300,
+            
+            save_strategy="steps",
+            save_steps=500,
+            save_total_limit=2,
+            bf16=self.llm_conf['bf16'],
+            fp16=self.llm_conf['fp16'],
+            gradient_checkpointing=self.llm_conf['gradient_checkpointing'],
+            report_to="none",
+            dataloader_num_workers=4,
+            remove_unused_columns=True
+        )
+        
+        # DataCollatorForSeq2Seq 会自动处理 padding，并将 labels 中的 pad token 设为 -100
+        # 这样模型计算 loss 时会忽略 padding 部分
+        data_collator = DataCollatorForSeq2Seq(
+            tokenizer=self.tokenizer,
+            padding=True,
+            return_tensors="pt"
+        )
+        
+        trainer = Trainer(
+            model=self.model,
+            args=training_args,
+            train_dataset=self.train_dataset,
+            eval_dataset=self.eval_dataset,
+            tokenizer=self.tokenizer,
+            data_collator=data_collator
+        )
+        
+        # Resume Checkpoint Logic
+        checkpoint = None
+        if os.path.exists(self.output_dir):
+            dirs = [d for d in os.listdir(self.output_dir) if d.startswith("checkpoint")]
+            if dirs:
+                latest = sorted(dirs, key=lambda x: int(x.split("-")[-1]))[-1]
+                checkpoint = os.path.join(self.output_dir, latest)
+                self.logger.info(f"Resuming from checkpoint: {checkpoint}")
+        
+        trainer.train(resume_from_checkpoint=checkpoint)
+        
+        self.logger.info(f"Saving final model to {self.output_dir}")
+        trainer.save_model(self.output_dir)
 
 def main():
-    # Load config
-    config_path = './config/config.yaml'
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    
-    # Setup logging
-    logger = setup_logging()
-    logger.info("Starting LLM training for HierGR-SeqRec")
-    
-    # Set random seed
-    torch.manual_seed(config['hardware']['seed'])
-    
-    # Load model and tokenizer
-    model, tokenizer, original_vocab_size = load_model_and_tokenizer(config, logger)
-    
-    # Setup LoRA
-    model = setup_lora(model, config, logger, original_vocab_size)
-    
-    # Prepare datasets
-    logger.info("Preparing datasets...")
-    train_dataset, valid_dataset = prepare_datasets(config, tokenizer)
-    
-    # Data collator
-    data_collator = DataCollatorForPromptDataset(
-        tokenizer=tokenizer,
-        max_length=config['llm']['max_seq_length']
-    )
-    
-    # Training arguments
-    output_dir = config['data']['llm_ckpt_dir']
-    training_args = setup_training_args(config, output_dir)
-    
-    # Log training configuration to verify
-    logger.info("=" * 50)
-    logger.info("Training Configuration:")
-    logger.info(f"  - eval_steps: {training_args.eval_steps}")
-    logger.info(f"  - save_steps: {training_args.save_steps}")
-    logger.info(f"  - logging_steps: {training_args.logging_steps}")
-    logger.info(f"  - eval_strategy: {training_args.eval_strategy}")
-    logger.info("=" * 50)
-    
-    # Trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=valid_dataset,
-        data_collator=data_collator,
-        tokenizer=tokenizer
-    )
-    
-    # Check for existing checkpoint to resume training
-    checkpoint_dir = None
-    if os.path.exists(output_dir):
-        checkpoints = [d for d in os.listdir(output_dir) if d.startswith('checkpoint-')]
-        if checkpoints:
-            # Sort by step number and get the latest
-            latest_checkpoint = sorted(checkpoints, key=lambda x: int(x.split('-')[-1]))[-1]
-            checkpoint_dir = os.path.join(output_dir, latest_checkpoint)
-            logger.info(f"Found existing checkpoint: {checkpoint_dir}")
-            logger.info("Resuming training from checkpoint...")
-            logger.info("NOTE: Using CURRENT training args (not checkpoint's old config)")
-            logger.info(f"  - Current eval_steps will be: {training_args.eval_steps}")
-            
-            # CRITICAL: Modify trainer_state.json in checkpoint to use current config
-            # This prevents the checkpoint's old config from overriding our new settings
-            trainer_state_file = os.path.join(checkpoint_dir, "trainer_state.json")
-            if os.path.exists(trainer_state_file):
-                logger.info(f"Modifying {trainer_state_file} to use current training config...")
-                with open(trainer_state_file, 'r', encoding='utf-8') as f:
-                    trainer_state = json.load(f)
-                
-                # Log old values
-                old_eval_steps = trainer_state.get('eval_steps', 'N/A')
-                old_save_steps = trainer_state.get('save_steps', 'N/A')
-                logger.info(f"  - Old eval_steps in checkpoint: {old_eval_steps}")
-                logger.info(f"  - Old save_steps in checkpoint: {old_save_steps}")
-                
-                # Update with current config
-                trainer_state['eval_steps'] = training_args.eval_steps
-                trainer_state['save_steps'] = training_args.save_steps
-                trainer_state['logging_steps'] = training_args.logging_steps
-                
-                # Save modified state back
-                with open(trainer_state_file, 'w', encoding='utf-8') as f:
-                    json.dump(trainer_state, f, indent=2)
-                
-                logger.info(f"  ✓ Updated eval_steps to: {training_args.eval_steps}")
-                logger.info(f"  ✓ Updated save_steps to: {training_args.save_steps}")
-                logger.info("  ✓ trainer_state.json modified successfully")
-        else:
-            logger.info("No checkpoint found, starting training from scratch")
-    
-    # Train (automatically resume if checkpoint exists)
-    logger.info("Starting training...")
-    train_result = trainer.train(resume_from_checkpoint=checkpoint_dir)
-    
-    # Verify actual configuration used during training
-    logger.info("=" * 50)
-    logger.info("Training completed with configuration:")
-    logger.info(f"  - Actual eval_steps used: {trainer.args.eval_steps}")
-    logger.info(f"  - Total steps: {trainer.state.global_step}")
-    logger.info("=" * 50)
-    
-    # Save final model
-    logger.info("Saving final model...")
-    trainer.save_model(output_dir)
-    trainer.save_state()
-    
-    # Save metrics
-    metrics = train_result.metrics
-    trainer.log_metrics("train", metrics)
-    trainer.save_metrics("train", metrics)
-    
-    logger.info("Training completed!")
-    logger.info(f"Final model saved to: {output_dir}")
-
+    trainer = SFTTrainer()
+    trainer.load_model_and_tokenizer()
+    trainer.process_data()
+    trainer.train()
 
 if __name__ == '__main__':
     main()

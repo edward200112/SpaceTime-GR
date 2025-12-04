@@ -1,14 +1,10 @@
 """
-Step 4: 多任务 Prompt 构造 (Multi-Task Prompt Construction)
+Step 4: 多任务 Prompt 构造 (Multi-Task Prompt Construction) - Optimized
 
-目标：构造三种训练任务的 Prompt
-输入：user_sequences.jsonl
-输出：train_prompts.jsonl, valid_prompts.jsonl, test_prompts.jsonl
-
-任务类型：
-A. 序列推荐（主任务）- 预测下一个 Cluster ID
-B. 用户偏好摘要 - 生成文本描述
-C. 语义 ID 对齐 - Text ↔ ID 双向映射
+优化点：
+1. 融入地理 Context (User Current City) 到 Task A Prompt 中，辅助位置感知推荐。
+2. 适配 Step 2/3 生成的 Unique ID (<c0, c1, c2, suffix>)。
+3. 强化 Task C (Alignment) 的地理约束，确保 Text->ID 任务可解。
 """
 
 import json
@@ -17,7 +13,6 @@ import random
 from tqdm import tqdm
 import yaml
 from collections import defaultdict
-
 
 class PromptConstructor:
     def __init__(self, config):
@@ -30,345 +25,236 @@ class PromptConstructor:
         # Task weights
         self.task_weights = self.prompt_config['task_weights']
         
-        # Prompt templates
-        self.task_a_template = self.prompt_config['task_a_template']
-        self.task_b_template = self.prompt_config['task_b_template']
-        self.task_c1_template = self.prompt_config['task_c1_template']
-        self.task_c2_template = self.prompt_config['task_c2_template']
+        # Templates (Updated for Geo-Context)
+        # 建议在 config.yaml 中更新模板，或者在此处硬编码覆盖
+        self.task_a_template = (
+            "User is currently in {current_city}. "
+            "Based on the visit history below, predict the next place to visit.\n"
+            "{longterm_summary}"
+            "User History:\n{history}\n"
+            "Response:"
+        )
         
-        # History formats
-        self.history_format = self.prompt_config['history_item_format']
-        self.history_format_with_rating = self.prompt_config['history_item_format_with_rating']
+        self.task_b_template = "Summarize the user's preferences based on the following visit history:\n{history}\nResponse:"
+        
+        # Text -> ID
+        self.task_c1_template = "What is the Semantic ID for \"{query}\"?\nResponse:"
+        
+        # ID -> Text
+        self.task_c2_template = "Describe the semantic meaning of Cluster ID {cluster_id}.\nResponse:"
         
         # Data
-        self.sequences = []
+        self.train_sequences = []
+        self.valid_sequences = []
+        self.test_sequences = []
         self.sid_mapping = {}
         self.cluster_to_businesses = defaultdict(list)
     
     def load_sequences(self):
-        """加载用户序列"""
-        print("\n=== Loading User Sequences ===")
+        """加载分好类的数据集"""
+        print("\n=== Loading Sequences ===")
         
-        sequence_file = os.path.join(
-            self.processed_dir,
-            self.data_config['user_sequences_file']
-        )
-        
-        with open(sequence_file, 'r', encoding='utf-8') as f:
-            for line in tqdm(f, desc="Loading sequences"):
-                self.sequences.append(json.loads(line.strip()))
-        
-        print(f"Loaded {len(self.sequences)} sequences")
-        
-        # Load split info
-        split_file = sequence_file.replace('.jsonl', '_split.json')
-        with open(split_file, 'r', encoding='utf-8') as f:
-            split_info = json.load(f)
-        
-        train_count = split_info['train_count']
-        valid_count = split_info['valid_count']
-        test_count = split_info['test_count']
-        
-        self.train_sequences = self.sequences[:train_count]
-        self.valid_sequences = self.sequences[train_count:train_count+valid_count]
-        self.test_sequences = self.sequences[train_count+valid_count:]
+        def load_split(name):
+            path = os.path.join(self.processed_dir, name)
+            data = []
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        data.append(json.loads(line))
+            return data
+
+        self.train_sequences = load_split('train.jsonl')
+        self.valid_sequences = load_split('valid.jsonl')
+        self.test_sequences = load_split('test.jsonl')
         
         print(f"Train: {len(self.train_sequences)}")
         print(f"Valid: {len(self.valid_sequences)}")
         print(f"Test: {len(self.test_sequences)}")
     
     def load_sid_mapping(self):
-        """加载 SID 映射"""
         print("\n=== Loading SID Mapping ===")
-        
-        mapping_file = os.path.join(
-            self.processed_dir,
-            self.data_config['sid_mapping_file']
-        )
+        mapping_file = os.path.join(self.processed_dir, self.data_config['sid_mapping_file'])
         
         with open(mapping_file, 'r', encoding='utf-8') as f:
             self.sid_mapping = json.load(f)
         
-        # Build cluster to businesses mapping
+        # Build cluster mapping (using only c0, c1 for semantic grouping)
         for business_id, info in self.sid_mapping.items():
-            cluster_tuple = tuple(info['cluster_id'])
-            self.cluster_to_businesses[cluster_tuple].append({
-                'business_id': business_id,
-                'name': info['name'],
-                'categories': info['categories'],
-                'city': info['city']
-            })
+            # 这里我们用前两层作为语义聚类 ID
+            cluster_tuple = tuple(info['cluster_id']) # [c0, c1]
+            self.cluster_to_businesses[cluster_tuple].append(info)
         
         print(f"Loaded {len(self.sid_mapping)} items")
-        print(f"Found {len(self.cluster_to_businesses)} unique clusters")
     
     def format_history(self, history, include_rating=False):
-        """格式化历史序列"""
-        history_lines = []
-        
+        lines = []
         for idx, item in enumerate(history, 1):
+            name = item['name']
+            cat = item['categories'].split(',')[0].strip()
+            # 可以在历史中也加入 city，增强 LLM 对移动轨迹的理解
+            city = item['city']
+            
             if include_rating:
-                line = self.history_format_with_rating.format(
-                    name=item['name'],
-                    category=item['categories'].split(',')[0].strip(),
-                    rating=item['stars']
-                )
+                line = f"[{name}] ({cat} in {city}) - {item['stars']} stars"
             else:
-                line = self.history_format.format(
-                    name=item['name'],
-                    category=item['categories'].split(',')[0].strip(),
-                    cluster_id=item['cluster_str']
-                )
-            history_lines.append(f"{idx}. {line}")
-        
-        return '\n'.join(history_lines)
+                # 训练 Task A 时，历史可以用 ID 表示，也可以用 Text 表示
+                # 为了让 LLM 理解语义，这里使用 Text 描述
+                line = f"[{name}] ({cat} in {city})"
+            
+            lines.append(f"{idx}. {line}")
+        return '\n'.join(lines)
     
     def create_task_a_prompt(self, sequence):
-        """任务 A：序列推荐"""
-        # Long-term summary
+        """Task A: Recommendation (Next Item Prediction)"""
         longterm_text = ""
         if sequence.get('longterm_summary'):
             longterm_text = f"User Profile: {sequence['longterm_summary']}\n"
         
-        # Format history
-        history_text = self.format_history(sequence['history'], include_rating=False)
+        history_text = self.format_history(sequence['history'])
         
-        # Fill template
+        # 关键优化：加入 current_city
+        current_city = sequence.get('current_city', 'Unknown City')
+        
         instruction = self.task_a_template.format(
+            current_city=current_city,
             longterm_summary=longterm_text,
             history=history_text
         ).strip()
         
-        # Output: Cluster ID
-        output = sequence['target']['cluster_str']
+        # Output: 使用 Step 2 生成的唯一 ID (sid_str)
+        # e.g., "<12, 45, 88, 0>"
+        output = sequence['target']['sid_str']
         
         return {
             'task': 'task_a_recommendation',
             'instruction': instruction,
             'input': '',
             'output': output,
+            # 保留 Metadata 供评估和 RL 使用
             'metadata': {
                 'user_id': sequence['user_id'],
-                'target_business_id': sequence['target']['business_id'],
-                'target_name': sequence['target']['name']
+                'target_id': sequence['target']['business_id'],
+                'target_lat': sequence['target']['latitude'],
+                'target_lon': sequence['target']['longitude'],
+                'target_sid': output
             }
         }
     
     def create_task_b_prompt(self, sequence):
-        """任务 B：用户偏好摘要"""
-        # Format history with ratings
+        """Task B: Preference Summary"""
         history_text = self.format_history(sequence['history'], include_rating=True)
-        
         instruction = self.task_b_template.format(history=history_text).strip()
         
-        # Generate preference summary
-        output = self.generate_preference_summary(sequence['history'])
+        # 简单的规则生成 Ground Truth Summary
+        # 实际场景中可以用 GPT-4 生成高质量 Summary 作为 Teacher
+        summary = self.generate_preference_summary(sequence['history'])
         
         return {
             'task': 'task_b_preference_summary',
             'instruction': instruction,
             'input': '',
-            'output': output,
-            'metadata': {
-                'user_id': sequence['user_id']
-            }
+            'output': summary
         }
     
     def generate_preference_summary(self, history):
-        """生成用户偏好摘要（规则）"""
-        # 统计高分项的类别
         high_rated = [item for item in history if item['stars'] >= 4.0]
+        if not high_rated: return "User has diverse tastes."
         
-        if not high_rated:
-            return "User has diverse tastes."
-        
-        # 提取主要类别
-        category_counts = defaultdict(int)
+        cats = defaultdict(int)
         cities = set()
-        
         for item in high_rated:
-            categories = item['categories'].split(',')
-            for cat in categories:
-                category_counts[cat.strip()] += 1
+            for c in item['categories'].split(','):
+                cats[c.strip()] += 1
             cities.add(item['city'])
+            
+        top_cats = sorted(cats.items(), key=lambda x: x[1], reverse=True)[:3]
+        cat_str = ", ".join([c[0] for c in top_cats])
         
-        # 找到最常出现的类别
-        top_categories = sorted(category_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-        
-        if not top_categories:
-            return "User has diverse tastes."
-        
-        cat_names = [cat for cat, _ in top_categories]
-        
-        # 构造摘要
-        if len(cat_names) == 1:
-            summary = f"The user enjoys {cat_names[0]}"
-        elif len(cat_names) == 2:
-            summary = f"The user enjoys {cat_names[0]} and {cat_names[1]}"
-        else:
-            summary = f"The user enjoys {', '.join(cat_names[:-1])}, and {cat_names[-1]}"
-        
-        if len(cities) > 2:
-            summary += " across multiple cities"
-        
-        summary += "."
-        
+        summary = f"The user enjoys {cat_str}."
+        if cities:
+            summary += f" They are active in {', '.join(list(cities)[:2])}."
         return summary
     
     def create_task_c1_prompt(self):
-        """任务 C1：Text -> ID"""
-        # 随机选择一个商家
-        business_id = random.choice(list(self.sid_mapping.keys()))
-        info = self.sid_mapping[business_id]
+        """Task C1: Text -> ID (Alignment)"""
+        # 随机采样一个 Business
+        bid = random.choice(list(self.sid_mapping.keys()))
+        info = self.sid_mapping[bid]
         
-        # 构造查询文本
-        query = f"{info['categories']} in {info['city']}"
+        # Query 必须包含地理信息，否则无法对应到唯一的 Geo-aware ID
+        # Template: "[Category] in [City]"
+        cat = info['categories'].split(',')[0].strip()
+        city = info['city']
+        query = f"{cat} in {city}"
         
-        instruction = self.task_c1_template.format(query=query).strip()
-        output = info['cluster_str']
+        # 还可以增加 Name 增强准确性
+        # query = f"{info['name']} ({cat}) in {city}"
         
-        return {
-            'task': 'task_c_sid_alignment',
-            'instruction': instruction,
-            'input': '',
-            'output': output,
-            'metadata': {
-                'business_id': business_id,
-                'name': info['name']
-            }
-        }
-    
-    def create_task_c2_prompt(self):
-        """任务 C2：ID -> Text"""
-        # 随机选择一个 cluster
-        cluster_tuple = random.choice(list(self.cluster_to_businesses.keys()))
-        businesses = self.cluster_to_businesses[cluster_tuple]
+        instruction = self.task_c1_template.format(query=query)
         
-        cluster_str = '<' + ', '.join(map(str, cluster_tuple)) + '>'
-        
-        instruction = self.task_c2_template.format(cluster_id=cluster_str).strip()
-        
-        # 生成描述
-        categories = set()
-        cities = set()
-        for biz in businesses:
-            for cat in biz['categories'].split(','):
-                categories.add(cat.strip())
-            cities.add(biz['city'])
-        
-        output = f"Businesses in categories: {', '.join(list(categories)[:3])}"
-        if len(cities) > 1:
-            output += f", typically found in {', '.join(list(cities)[:3])}"
-        output += "."
+        # Output: Unique ID
+        output = info['sid_str']
         
         return {
             'task': 'task_c_sid_alignment',
             'instruction': instruction,
             'input': '',
-            'output': output,
-            'metadata': {
-                'cluster_id': list(cluster_tuple)
-            }
+            'output': output
         }
-    
+
     def construct_prompts_for_split(self, sequences, split_name):
-        """为某个数据集构造 Prompt"""
-        print(f"\n=== Constructing Prompts for {split_name} ===")
-        
+        print(f"\n=== Constructing {split_name} Prompts ===")
         prompts = []
         
-        # 任务 A：序列推荐（所有序列）
-        for seq in tqdm(sequences, desc=f"{split_name} Task A"):
+        # 1. Task A (All Sequences)
+        for seq in tqdm(sequences, desc="Task A"):
             prompts.append(self.create_task_a_prompt(seq))
-        
-        # 如果是训练集，添加任务 B 和 C
+            
+        # 2. Task B & C (Only for Train)
         if split_name == 'train':
-            # 任务 B：偏好摘要（按权重采样）
-            n_task_b = int(len(sequences) * self.task_weights['task_b_preference_summary'] / 
-                          self.task_weights['task_a_recommendation'])
-            sampled_seqs = random.sample(sequences, min(n_task_b, len(sequences)))
-            
-            for seq in tqdm(sampled_seqs, desc=f"{split_name} Task B"):
+            # Task B
+            n_task_b = int(len(sequences) * 0.1) # 10% ratio
+            b_samples = random.sample(sequences, min(n_task_b, len(sequences)))
+            for seq in tqdm(b_samples, desc="Task B"):
                 prompts.append(self.create_task_b_prompt(seq))
-            
-            # 任务 C：ID 对齐（按权重采样）
-            n_task_c = int(len(sequences) * self.task_weights['task_c_sid_alignment'] / 
-                          self.task_weights['task_a_recommendation'])
-            
-            for _ in tqdm(range(n_task_c), desc=f"{split_name} Task C"):
-                if random.random() < 0.5:
-                    prompts.append(self.create_task_c1_prompt())
-                else:
-                    prompts.append(self.create_task_c2_prompt())
+                
+            # Task C
+            n_task_c = int(len(sequences) * 0.1) # 10% ratio
+            for _ in tqdm(range(n_task_c), desc="Task C"):
+                prompts.append(self.create_task_c1_prompt())
         
-        # Shuffle
         random.shuffle(prompts)
-        
-        print(f"Generated {len(prompts)} prompts for {split_name}")
-        
-        # Count by task
-        task_counts = defaultdict(int)
-        for p in prompts:
-            task_counts[p['task']] += 1
-        for task, count in task_counts.items():
-            print(f"  {task}: {count}")
-        
+        print(f"Total {split_name} prompts: {len(prompts)}")
         return prompts
     
-    def save_prompts(self, train_prompts, valid_prompts, test_prompts):
-        """保存 Prompt 数据"""
-        print("\n=== Saving Prompts ===")
-        
-        splits = {
-            'train': train_prompts,
-            'valid': valid_prompts,
-            'test': test_prompts
-        }
-        
-        for split_name, prompts in splits.items():
-            if split_name == 'train':
-                output_file = os.path.join(self.processed_dir, self.data_config['train_prompts_file'])
-            elif split_name == 'valid':
-                output_file = os.path.join(self.processed_dir, self.data_config['valid_prompts_file'])
-            else:
-                output_file = os.path.join(self.processed_dir, self.data_config['test_prompts_file'])
-            
-            with open(output_file, 'w', encoding='utf-8') as f:
-                for prompt in prompts:
-                    f.write(json.dumps(prompt, ensure_ascii=False) + '\n')
-            
-            print(f"Saved {len(prompts)} prompts to {output_file}")
-    
+    def save_prompts(self, data, filename):
+        path = os.path.join(self.processed_dir, filename)
+        with open(path, 'w', encoding='utf-8') as f:
+            for item in data:
+                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+        print(f"Saved to {filename}")
+
     def run(self):
-        """执行完整流程"""
         print("\n" + "="*60)
-        print("Step 4: Constructing Multi-Task Prompts")
+        print("Step 4: Constructing Prompts (Optimized)")
         print("="*60)
         
         self.load_sequences()
         self.load_sid_mapping()
         
-        train_prompts = self.construct_prompts_for_split(self.train_sequences, 'train')
-        valid_prompts = self.construct_prompts_for_split(self.valid_sequences, 'valid')
-        test_prompts = self.construct_prompts_for_split(self.test_sequences, 'test')
+        train_p = self.construct_prompts_for_split(self.train_sequences, 'train')
+        valid_p = self.construct_prompts_for_split(self.valid_sequences, 'valid')
+        test_p = self.construct_prompts_for_split(self.test_sequences, 'test')
         
-        self.save_prompts(train_prompts, valid_prompts, test_prompts)
-        
-        print("\n✓ Step 4 completed successfully!")
-
+        self.save_prompts(train_p, self.data_config['train_prompts_file'])
+        self.save_prompts(valid_p, self.data_config['valid_prompts_file'])
+        self.save_prompts(test_p, self.data_config['test_prompts_file'])
 
 def main():
-    # Set random seed
-    random.seed(42)
-    
-    # Load config
     with open('./config/config.yaml', 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
-    
-    # Construct prompts
     constructor = PromptConstructor(config)
     constructor.run()
-
 
 if __name__ == '__main__':
     main()

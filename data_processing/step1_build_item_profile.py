@@ -1,19 +1,19 @@
 """
-Step 1: 商户画像构建 (Item Profile Construction)
+Step 1: 商户画像构建 (Item Profile Construction) - Optimized
 
-目标：为 RQ-VAE 提供高质量的语义输入
-输入：business.json, review.json, tip.json
-输出：item_profiles.jsonl - 每个商家的富文本描述
-
-逻辑：聚合 Name + City + Categories + Attributes + Top Reviews
+优化点：
+1. 移除 Hash ID (避免对语义模型产生噪声干扰)
+2. 强化地理差异性 (加入 Postal Code 和自然语言地址，解决连锁店冲突)
+3. 属性自然语言化 (将 key-value 转换为通顺的句子)
+4. 数据清洗 (去除评论中的换行符和乱码)
 """
 
 import json
 import os
+import re
 from collections import defaultdict
 from tqdm import tqdm
 import yaml
-
 
 class ItemProfileBuilder:
     def __init__(self, config):
@@ -31,6 +31,16 @@ class ItemProfileBuilder:
         self.business_reviews = defaultdict(list)
         self.business_tips = defaultdict(list)
     
+    def clean_text(self, text):
+        """清洗文本：去除换行、多余空格"""
+        if not text:
+            return ""
+        # 替换换行符为空格
+        text = text.replace('\n', ' ').replace('\r', ' ')
+        # 去除多余空格
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
     def load_businesses(self):
         """加载商家基本信息"""
         print("\n=== Loading Business Data ===")
@@ -44,42 +54,32 @@ class ItemProfileBuilder:
         print(f"Loaded {len(self.businesses)} businesses")
     
     def load_reviews(self):
-        """加载评论数据，为每个商家提取 Top-K 有用评论"""
+        """加载评论数据"""
         print("\n=== Loading Review Data ===")
         review_file = os.path.join(self.raw_dir, self.data_config['review_file'])
         
-        skipped_count = 0
-        success_count = 0
-        
         with open(review_file, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(tqdm(f, desc="Loading reviews"), 1):
+            for line in tqdm(f, desc="Loading reviews"):
                 try:
                     review = json.loads(line.strip())
                     business_id = review['business_id']
                     
-                    # 只保留评分和有用性信息
+                    # 简单的预清洗
+                    cleaned_text = self.clean_text(review['text'])
+                    
                     self.business_reviews[business_id].append({
-                        'text': review['text'],
+                        'text': cleaned_text,
                         'useful': review.get('useful', 0),
                         'stars': review['stars']
                     })
-                    success_count += 1
-                except json.JSONDecodeError as e:
-                    skipped_count += 1
-                    if skipped_count <= 10:  # 只打印前 10 个错误
-                        print(f"\nWarning: Skipping malformed JSON at line {line_num}: {str(e)[:100]}")
-                except Exception as e:
-                    skipped_count += 1
-                    if skipped_count <= 10:
-                        print(f"\nWarning: Error at line {line_num}: {str(e)[:100]}")
+                except:
+                    continue
         
-        print(f"\nLoaded {success_count} reviews for {len(self.business_reviews)} businesses")
-        if skipped_count > 0:
-            print(f"Skipped {skipped_count} malformed lines ({skipped_count/success_count*100:.2f}%)")
-        
-        # 为每个商家按 useful 排序，保留 Top-K
-        top_k = self.preprocess_config['top_reviews_count']
+        # 排序并保留 Top-K
+        top_k = self.preprocess_config.get('top_reviews_count', 3) # 默认取3条，太多会稀释语义
         for business_id in self.business_reviews:
+            # 优先选择 useful 且 长度适中 的评论（过短的信息量少，过长的可能跑题）
+            # 这里简单策略：按 useful 降序
             self.business_reviews[business_id] = sorted(
                 self.business_reviews[business_id],
                 key=lambda x: x['useful'],
@@ -87,26 +87,26 @@ class ItemProfileBuilder:
             )[:top_k]
     
     def load_tips(self):
-        """加载 Tip 数据（可选）"""
+        """加载 Tip 数据"""
         print("\n=== Loading Tip Data ===")
         tip_file = os.path.join(self.raw_dir, "yelp_academic_dataset_tip.json")
         
         if not os.path.exists(tip_file):
-            print("Tip file not found, skipping...")
             return
         
         with open(tip_file, 'r', encoding='utf-8') as f:
             for line in tqdm(f, desc="Loading tips"):
-                tip = json.loads(line.strip())
-                business_id = tip['business_id']
-                self.business_tips[business_id].append({
-                    'text': tip['text'],
-                    'likes': tip.get('likes', 0)
-                })
+                try:
+                    tip = json.loads(line.strip())
+                    business_id = tip['business_id']
+                    self.business_tips[business_id].append({
+                        'text': self.clean_text(tip['text']),
+                        'likes': tip.get('likes', 0)
+                    })
+                except:
+                    continue
         
-        print(f"Loaded tips for {len(self.business_tips)} businesses")
-        
-        # 按 likes 排序
+        # 按 likes 排序，取 Top 3
         for business_id in self.business_tips:
             self.business_tips[business_id] = sorted(
                 self.business_tips[business_id],
@@ -114,107 +114,98 @@ class ItemProfileBuilder:
                 reverse=True
             )[:3]
     
-    def extract_key_attributes(self, attributes):
-        """提取关键属性"""
-        if not attributes or attributes == 'None':
-            return []
-        
-        # 关键属性列表
-        key_attrs = [
-            'RestaurantsPriceRange2', 'Ambience', 'GoodForKids',
-            'RestaurantsTakeOut', 'RestaurantsDelivery', 'OutdoorSeating',
-            'WiFi', 'Alcohol', 'NoiseLevel', 'RestaurantsAttire',
-            'HasTV', 'Caters', 'GoodForGroups'
-        ]
-        
-        extracted = []
-        for attr in key_attrs:
-            if attr in attributes and attributes[attr] not in [None, 'None', 'False']:
-                value = attributes[attr]
-                
-                # 格式化属性值
-                if attr == 'RestaurantsPriceRange2':
-                    price_map = {'1': '$', '2': '$$', '3': '$$$', '4': '$$$$'}
-                    value = price_map.get(str(value), value)
-                    extracted.append(f"Price: {value}")
-                elif attr == 'Ambience' and isinstance(value, dict):
-                    # Ambience 是字典，提取 True 的键
-                    amb = [k for k, v in value.items() if v in [True, 'True']]
-                    if amb:
-                        extracted.append(f"Ambience: {', '.join(amb)}")
-                elif value in [True, 'True']:
-                    # 布尔属性直接添加属性名
-                    extracted.append(attr.replace('Restaurants', '').replace('GoodFor', 'Good for '))
-                else:
-                    extracted.append(f"{attr}: {value}")
-        
-        return extracted
-    
-    def build_item_profile(self, business_id, business):
-        """为单个商家构建富文本描述"""
-        import hashlib
-        
-        # 1. 基础信息
-        name = business.get('name', 'Unknown')
-        city = business.get('city', 'Unknown')
-        state = business.get('state', '')
-        address = business.get('address', '')
-        categories = business.get('categories', '')
-        
-        if not categories:
-            categories = 'General'
-        
-        # 生成唯一性标识（用于区分连锁店）
-        # 方法1：使用 business_id 的哈希后缀
-        id_hash = hashlib.md5(business_id.encode()).hexdigest()[:6]
-        
-        profile_parts = []
-        
-        # Name and Location（添加地址和唯一ID）
-        profile_parts.append(f"Name: {name}.")
-        
-        # 添加地址信息（如果有）以区分连锁店
-        if address:
-            # 截断地址避免过长
-            address_short = address[:50] if len(address) > 50 else address
-            profile_parts.append(f"Address: {address_short}.")
-        
-        profile_parts.append(f"City: {city}, {state}.")
-        
-        # 添加唯一ID哈希（强制区分）
-        profile_parts.append(f"ID: {id_hash}.")
-        
-        profile_parts.append(f"Categories: {categories}.")
-        
-        # 2. 属性信息
-        attributes = business.get('attributes', {})
-        key_attrs = self.extract_key_attributes(attributes)
-        if key_attrs:
-            profile_parts.append(f"Attributes: {'; '.join(key_attrs)}.")
-        
-        # 3. Top Reviews（众包语义）
-        reviews = self.business_reviews.get(business_id, [])
-        if reviews:
-            highlights = []
-            for review in reviews:
-                text = review['text']
-                # 截断过长的评论
-                max_len = self.preprocess_config['max_review_length']
-                if len(text) > max_len:
-                    text = text[:max_len] + "..."
-                highlights.append(text)
+    def format_attribute(self, key, value):
+        """将属性转换为自然语言句子，增强语义理解"""
+        if value in ['None', 'False', None]:
+            return None
             
-            profile_parts.append(f"Highlights: {' '.join(highlights)}")
+        key_map = {
+            'RestaurantsPriceRange2': lambda v: f"Price range is {len(str(v)) * '$'} ({['Cheap', 'Moderate', 'Expensive', 'Luxury'][int(v)-1] if str(v).isdigit() and 1<=int(v)<=4 else v})" if str(v).isdigit() else None,
+            'WiFi': lambda v: f"Wi-Fi is {v}" if v != "u'no'" and v != "'no'" else "No Wi-Fi",
+            'Alcohol': lambda v: f"Serves {v}" if v != "u'none'" and v != "'none'" else "No Alcohol",
+            'OutdoorSeating': lambda v: "Has outdoor seating" if v == "True" else None,
+            'RestaurantsDelivery': lambda v: "Offers delivery" if v == "True" else None,
+            'RestaurantsTakeOut': lambda v: "Offers takeout" if v == "True" else None,
+            'GoodForKids': lambda v: "Good for kids" if v == "True" else None,
+            'HasTV': lambda v: "Has TV" if v == "True" else None,
+            'NoiseLevel': lambda v: f"Noise level is {v}",
+            'Ambience': lambda v: f"Ambience is {', '.join([k for k, val in eval(v).items() if val])}" if isinstance(v, str) and '{' in v else None
+        }
+
+        if key in key_map:
+            try:
+                return key_map[key](str(value))
+            except:
+                return f"{key}: {value}"
+        return None
+
+    def build_item_profile(self, business_id, business):
+        """
+        构建富文本描述
+        格式策略：[Category] -> [Name] -> [Location Details] -> [Features] -> [Vibe/Reviews]
+        这种顺序符合由粗到细的语义逻辑
+        """
         
-        # 4. Tips（可选）
+        # 1. 核心身份 (Category + Name)
+        name = self.clean_text(business.get('name', 'Unknown'))
+        categories = self.clean_text(business.get('categories', 'General Place'))
+        
+        # 2. 地理语义 (这是解决 "Collision" 的关键)
+        # 必须包含 Postal Code，因为它是最强的区域语义特征
+        city = business.get('city', '')
+        state = business.get('state', '')
+        address = self.clean_text(business.get('address', ''))
+        postal_code = business.get('postal_code', '')
+        
+        location_desc = f"Located in {city}, {state}"
+        if postal_code:
+            location_desc += f" (Zip: {postal_code})"
+        if address:
+            location_desc += f", at {address}"
+        location_desc += "."
+
+        # 3. 属性特征 (自然语言化)
+        attributes = business.get('attributes', {})
+        attr_sentences = []
+        if attributes:
+            # 选取最具语义区分度的属性
+            target_attrs = ['RestaurantsPriceRange2', 'Ambience', 'NoiseLevel', 'Alcohol', 'WiFi', 'OutdoorSeating']
+            for k, v in attributes.items():
+                if k in target_attrs:
+                    sent = self.format_attribute(k, v)
+                    if sent: attr_sentences.append(sent)
+        
+        attr_text = ". ".join(attr_sentences) + "." if attr_sentences else ""
+        
+        # 4. 众包评价 (Reviews & Tips)
+        # 混合 Review 和 Tip，Tip 通常包含非常具体的 location 提示 (e.g., "Entrance is around the corner")
+        reviews = self.business_reviews.get(business_id, [])
         tips = self.business_tips.get(business_id, [])
+        
+        feedback_texts = []
+        # 取最有用的1条 Tip (通常短且包含关键信息)
         if tips:
-            tip_texts = [tip['text'] for tip in tips]
-            profile_parts.append(f"Tips: {' '.join(tip_texts)}")
+            feedback_texts.append(f"Tip: {tips[0]['text']}")
         
-        # 拼接成完整描述
-        raw_text = ' '.join(profile_parts)
+        # 取 Top 2 Reviews
+        for i, rev in enumerate(reviews[:2]):
+            text = rev['text']
+            # 截断过长评论，保留前 50 个词，避免覆盖其他特征的权重
+            words = text.split()
+            if len(words) > 50:
+                text = " ".join(words[:50]) + "..."
+            feedback_texts.append(f"Review: {text}")
+
+        feedback_str = " ".join(feedback_texts)
+
+        # === 最终拼接 ===
+        # 移除 "ID: hash" 这种噪声
+        # 模板：Category -> Name -> Location -> Attributes -> Feedback
+        raw_text = f"Category: {categories}. Name: {name}. {location_desc} {attr_text} {feedback_str}"
         
+        # 清理多余空格
+        raw_text = self.clean_text(raw_text)
+
         return {
             'business_id': business_id,
             'name': name,
@@ -222,20 +213,14 @@ class ItemProfileBuilder:
             'state': state,
             'categories': categories,
             'latitude': business.get('latitude'),
-            'longitude': business.get('longitude'),
+            'longitude': business.get('longitude'), # 保留给后续 RL 做 Geo Reward 计算
             'stars': business.get('stars', 0),
-            'review_count': business.get('review_count', 0),
             'raw_text': raw_text
         }
     
     def build_all_profiles(self):
-        """构建所有商家的画像"""
         print("\n=== Building Item Profiles ===")
-        
-        output_file = os.path.join(
-            self.processed_dir,
-            self.data_config['item_profile_file']
-        )
+        output_file = os.path.join(self.processed_dir, self.data_config['item_profile_file'])
         
         with open(output_file, 'w', encoding='utf-8') as f:
             for business_id, business in tqdm(self.businesses.items(), desc="Building profiles"):
@@ -245,28 +230,21 @@ class ItemProfileBuilder:
         print(f"\nSaved {len(self.businesses)} item profiles to {output_file}")
     
     def run(self):
-        """执行完整流程"""
         print("\n" + "="*60)
-        print("Step 1: Building Item Profiles")
+        print("Step 1: Building Item Profiles (Optimized)")
         print("="*60)
-        
         self.load_businesses()
         self.load_reviews()
         self.load_tips()
         self.build_all_profiles()
-        
         print("\n✓ Step 1 completed successfully!")
-
 
 def main():
     # Load config
     with open('./config/config.yaml', 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
-    
-    # Build item profiles
     builder = ItemProfileBuilder(config)
     builder.run()
-
 
 if __name__ == '__main__':
     main()

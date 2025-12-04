@@ -1,4 +1,4 @@
-# HierGR-SeqRec Configuration
+# HierGR-SeqRec Configuration - Optimized
 
 # ==================== Data Paths ====================
 data:
@@ -6,7 +6,7 @@ data:
   processed_dir: "/workspace/data/processed"
   embeddings_dir: "/workspace/data/embeddings"
   rqvae_ckpt_dir: "/workspace/data/rqvae_ckpt"
-  llm_ckpt_dir: "/workspace/data/llm_ckpt/checkpoint-14500"  # 指向最新checkpoint（绝对路径）
+  llm_ckpt_dir: "/workspace/data/llm_ckpt/checkpoint-14500"
   
   # Yelp dataset files
   business_file: "yelp_academic_dataset_business.json"
@@ -23,157 +23,148 @@ data:
 
 # ==================== Data Processing ====================
 preprocessing:
-  # K-core filtering
   min_user_interactions: 5
   min_item_interactions: 5
+  top_reviews_count: 3
+  max_review_length: 200
   
-  # Item profile construction
-  top_reviews_count: 3  # 选取 top-k 有用评论
-  max_review_length: 200  # 单条评论最大字符数
+  max_window_size: 15
+  min_history_length: 5
+  sliding_stride: 1
   
-  # Sliding window
-  max_window_size: 15  # 短期窗口大小
-  min_history_length: 5  # 最小历史长度
-  sliding_stride: 1  # 滑动步长（用于数据增强）
-  
-  # Long-term summary
   enable_longterm_summary: true
-  longterm_summary_method: "rule"  # rule / llm
+  longterm_summary_method: "rule"
   
-  # Train/Valid/Test split
   test_ratio: 0.1
   valid_ratio: 0.1
 
-# ==================== RQ-VAE ====================
+# ==================== RQ-VAE (CRITICAL UPDATES) ====================
 rqvae:
-  # Model architecture
-  in_dim: 768  # BERT embedding dimension
-  num_emb_list: [128,128, 128]  # 3-layer quantization
-  e_dim: 32  # Codebook embedding dimension
-  layers: [512, 256, 128, 64]  # Encoder/Decoder layers
+  # [修改 1] 输入维度改为 770
+  # Reason: 768 (BERT Text) + 2 (Lat/Lon Coordinates) = 770
+  in_dim: 770  
   
-  # Hierarchical design
-  cluster_levels: 2  # 前两层作为 Cluster ID <c0, c1>
+  # [修改 2] 增大 Codebook 以减少物理碰撞
+  # 原来是 [128, 128, 128]，建议增加到 256
+  num_emb_list: [256, 256, 256]  
   
-  # Training hyperparameters
+  e_dim: 32
+  layers: [512, 256, 128, 64]
+  cluster_levels: 2
+  
   lr: 0.001
-  epochs: 2000
-  batch_size: 1024
+  epochs: 2000 # 建议跑满，让聚类稳定
+  batch_size: 2048 # 如果显存够，越大越好，利于聚类
   eval_step: 100
   weight_decay: 0.0001
   dropout_prob: 0.0
   
-  # RQ-VAE specific
-  alpha: [1.5, 1.1, 1.0]  # 残差放大系数
-  beta: 0.3  # Diversity loss weight
+  # [修改 3] 调整 Alpha，让第一层（粗粒度地理）权重更大
+  alpha: [2.0, 1.0, 1.0]  
+  beta: 0.25 # 稍微降低 diversity loss，优先保证重构准确性
   quant_loss_weight: 1.0
   loss_type: "mse"
   
-  # K-means initialization
   kmeans_init: true
   kmeans_iters: 100
-  
-  # Sinkhorn constraints
-  sk_epsilons: [0.0, 0.0, 0.003]  # 只在最后一层使用
+  sk_epsilons: [0.0, 0.0, 0.003]
   sk_iters: 50
-  n_clusters: 10
+  n_clusters: 256 # 最好与 num_emb_list 保持一致或用于初始化
 
 # ==================== LLM Training ====================
 llm:
-  # Model selection (使用本地下载的 1.5B 模型)
-  model_name: "/workspace/Qwen2_5-1.5B-Instruct"  # 本地模型路径（绝对路径）
-  
-  # LoRA configuration
+  model_name: "/workspace/Qwen2_5-1.5B-Instruct"
   use_lora: true
-  lora_r: 32
-  lora_alpha: 64
+  lora_r: 64 # 稍微加大，提升记忆能力
+  lora_alpha: 128
   lora_dropout: 0.1
-  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] # 全量 LoRA 效果更好
   
-  # Training hyperparameters
   lr: 2.0e-5
-  epochs: 1
-  batch_size: 16
-  gradient_accumulation_steps: 8
+  epochs: 3 # SFT 建议跑 2-3 个 epoch
+  batch_size: 8
+  gradient_accumulation_steps: 4
   max_seq_length: 2048
-  warmup_ratio: 0.1
+  warmup_ratio: 0.05
   weight_decay: 0.01
-  
-  # Optimization
   optimizer: "adamw_torch"
   lr_scheduler: "cosine"
   fp16: false
   bf16: true
   gradient_checkpointing: true
-  
-  # DeepSpeed (optional)
   use_deepspeed: false
-  deepspeed_config: "/workspace/config/deepspeed_config.json"
 
-# ==================== Multi-Task Prompt ====================
+# ==================== GRPO RL (NEW SECTION) ====================
+# [新增] 专门用于强化学习的配置
+grpo:
+  use_rl: true
+  
+  # Reward Weights (Dense Reward 设计)
+  reward_weights:
+    semantic: 0.1   # 预测 ID 的 Embedding 相似度
+    geo: 0.4        # 物理距离惩罚 (重要!)
+    format: 0.1     # 格式正确性
+    hit: 1.0        # 准确命中
+  
+  # RL Hyperparams
+  beta: 0.01         # KL penalty constraint (防止模型崩坏)
+  learning_rate: 1.0e-6 # RL 学习率通常比 SFT 低
+  num_generations: 8 # Group Size (G)
+  max_prompt_length: 1024
+  max_completion_length: 64
+  
+  # Geo settings
+  max_acceptable_distance_km: 50.0 # 超过这个距离 Geo Reward 为 0
+
+# ==================== Multi-Task Prompt (UPDATED) ====================
 prompt:
-  # Task distribution (A/B/C 任务混合比例)
   task_weights:
-    task_a_recommendation: 0.7
-    task_b_preference_summary: 0.2
+    task_a_recommendation: 0.8 # 提高主任务权重
+    task_b_preference_summary: 0.1
     task_c_sid_alignment: 0.1
   
-  # Prompt templates
+  # [修改 4] 更新模板以包含 {current_city}
   task_a_template: |
-    Instruction: You are a local guide. Based on the user's visit history, predict the Semantic Cluster ID of the next place they will visit.
+    Instruction: User is currently in {current_city}. Based on the user's visit history, predict the Semantic ID of the next place they will visit.
     
     {longterm_summary}
-    
     User History:
     {history}
     
     Response:
   
   task_b_template: |
-    Instruction: Analyze the user's history and summarize their preferences in natural language.
-    
+    Instruction: Analyze the user's history and summarize their preferences.
     User History:
     {history}
-    
     Response:
   
+  # [修改 5] 更新模板以包含地理 Query
   task_c1_template: |
-    Instruction: What is the Semantic Cluster ID for "{query}"?
-    
+    Instruction: What is the Semantic ID for "{query}"?
     Response:
   
   task_c2_template: |
-    Instruction: Describe the type of businesses belonging to Semantic Cluster ID {cluster_id}.
-    
+    Instruction: Describe the semantic meaning of Cluster ID {cluster_id}.
     Response:
   
-  # History item format
-  history_item_format: "[{name}] ({category}) -> {cluster_id}"
+  # 历史记录格式，可以使用 Text 或 ID，这里建议 SFT 阶段用 Text 增强理解
+  history_item_format: "[{name}] ({category} in {city})"
   history_item_format_with_rating: "[{name}] ({category}, Rating: {rating}/5)"
 
 # ==================== Inference ====================
 inference:
   top_k: 10
-  temperature: 0.7
-  beam_size: 3
-  location_filter: true  # 根据用户位置过滤
-  max_distance_km: 10  # 最大距离（公里）
-  
-  # Cluster expansion
-  expand_cluster: true  # 将预测的 Cluster ID 展开为具体商家
-  diversity_penalty: 0.5  # 多样性惩罚（避免推荐同类商家）
-
-# ==================== Logging ====================
-logging:
-  log_dir: "/workspace/logs"
-  wandb_project: "HierGR-SeqRec"
-  wandb_entity: null
-  log_interval: 10
-  save_interval: 500
+  temperature: 0.7 # 稍微降低，保证 ID 生成的有效性
+  beam_size: 1 # 生成式推荐通常不需要 beam search，sampling 更快
+  location_filter: true
+  max_distance_km: 20
+  expand_cluster: true
+  diversity_penalty: 0.0 # 设为 0，避免干扰准确性
 
 # ==================== Hardware ====================
 hardware:
   device: "cuda"
-  num_workers: 4
+  num_workers: 8 # 稍微调大
   pin_memory: true
   seed: 42
