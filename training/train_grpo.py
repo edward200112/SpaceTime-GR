@@ -26,7 +26,7 @@ def main():
     with open('./config/config.yaml', 'r') as f:
         config = yaml.safe_load(f)
         
-    sft_ckpt_path = "/workspace/data/llm_ckpt/checkpoint-14500" # 请确认路径
+    sft_ckpt_path = "/workspace/data/llm_ckpt/checkpoint-28000" # 请确认路径
     base_model_path = config['llm']['model_name']
     output_dir = os.path.join(config['data']['llm_ckpt_dir'], "grpo_final")
     
