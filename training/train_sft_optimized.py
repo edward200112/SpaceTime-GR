@@ -26,10 +26,10 @@ class SFTConfig:
     # 路径配置
     base_model_path = "/workspace/Qwen2_5-1.5B-Instruct"
     data_dir = "/workspace/data/processed"
-    train_file = "train_prompts.jsonl"
+    train_file = "train_prompts_balanced.jsonl"
     valid_file = "valid_prompts.jsonl"
     
-    output_dir = "/workspace/data/llm_ckpt_sft_v2_optimized"
+    output_dir = "/workspace/data/llm_ckpt_sft_v5_balanced"
 
     # 模型参数
     max_seq_length = 1024       
