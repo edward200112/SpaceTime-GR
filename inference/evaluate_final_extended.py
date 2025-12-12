@@ -209,10 +209,25 @@ class GRPOEvaluator:
 
 if __name__ == "__main__":
     BASE = "/workspace/Qwen2_5-1.5B-Instruct"
-    SFT = "/workspace/data/llm_ckpt_sft_v2_optimized/checkpoint-35000"
-    GRPO = "/workspace/data/grpo_v4_1_breadcrumbs/checkpoint-5000"
+    
+    # 1. 确认 SFT 基座 (必须与 train_grpo_v5.py 中的配置一致)
+    # 如果你上次直接复制了我的训练代码，这里就是 v2_optimized
+    SFT = "/workspace/data/llm_ckpt_sft_v5_balanced/checkpoint-2000"
+    
+    # 2. 修改 GRPO 路径 (指向 V5 目录)
+    # 3. 修改 Checkpoint (指向当前已存在的最新点，如 2000 或 2500)
+    # 建议先去文件夹里看一眼到底是 2000 还是 2500
+    GRPO = "/workspace/data/grpo_v5_weighted/checkpoint-2500"
+    
     MAP = "/workspace/data/processed/sid_mapping.json"
-    TEST = "/workspace/data/processed/train_prompts.jsonl"
+    TEST = "/workspace/data/processed/train_prompts_balanced.jsonl" 
+    
+    # 打印确认一下路径是否存在
+    print(f"Checking GRPO path: {GRPO}")
+    if not os.path.exists(GRPO):
+        print(f"❌ Error: Checkpoint not found at {GRPO}")
+        print("Please check /workspace/data/grpo_v5_weighted/ to see available checkpoints.")
+        sys.exit(1)
     
     evaluator = GRPOEvaluator(BASE, SFT, GRPO, MAP)
     evaluator.evaluate(TEST, num_samples=500, beams=10)
