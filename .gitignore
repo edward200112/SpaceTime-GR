@@ -19,6 +19,12 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+data/
+PinRec/
+HierGR/
+backup/
+data/processed_pinrec/*.npy
+data/processed_pinrec/
 
 # Virtual Environment
 venv/
@@ -32,6 +38,7 @@ ENV/
 *.swo
 
 # Data
+data/
 data/raw/*
 data/processed/*
 data/embeddings/*

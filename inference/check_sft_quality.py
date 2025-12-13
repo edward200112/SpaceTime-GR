@@ -10,7 +10,7 @@ import os
 
 # 配置
 BASE_MODEL_PATH = "/workspace/Qwen2_5-1.5B-Instruct"
-LORA_PATH = "/workspace/data/llm_ckpt/checkpoint-14500" # 等你有第一个checkpoint时修改这里
+LORA_PATH = "/workspace/data/llm_ckpt/checkpoint-28000" # 等你有第一个checkpoint时修改这里
 MAPPING_FILE = "/workspace/data/processed/sid_mapping.json"
 TEST_DATA = "/workspace/data/processed/test_prompts.jsonl"
 
