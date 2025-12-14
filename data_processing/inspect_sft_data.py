@@ -1,88 +1,84 @@
 import json
-import numpy as np
-from tqdm import tqdm
-from collections import Counter
+import os
+import random
 
-# 数据路径
-DATA_PATH = "/workspace/data/processed/train_balanced_pinrec.jsonl"
+# =================配置区域=================
+# 请确认这些路径是否正确
+TRAIN_DATA = "/workspace/data/processed/train_prompts.jsonl"
+TEST_DATA = "/workspace/data/processed/test_prompts.jsonl"
+MAPPING_FILE = "/workspace/data/processed/sid_mapping.json"
+# =========================================
 
-def inspect_data():
-    print(f"🕵️‍♂️ Starting Data Inspection for: {DATA_PATH}")
-    
-    max_id_found = 0
-    min_id_found = float('inf')
-    
-    act_counter = Counter()
-    missing_fields = 0
-    total_lines = 0
-    
-    # 抽样检查前 50,000 条，或者设为 None 跑全量
-    LIMIT = 100000 
-    
-    try:
-        with open(DATA_PATH, 'r') as f:
-            for i, line in tqdm(enumerate(f), total=LIMIT):
-                if LIMIT and i >= LIMIT: break
-                total_lines += 1
-                
-                try:
-                    row = json.loads(line)
-                    
-                    # 1. 检查关键字段是否存在
-                    if 'target_1' not in row or 'target_2' not in row:
-                        missing_fields += 1
-                        continue
-                        
-                    t1 = row['target_1']
-                    t2 = row['target_2']
-                    
-                    # 2. 检查 ID 范围
-                    ids = row.get('history_ids', []) + [t1.get('id', 0), t2.get('id', 0)]
-                    curr_max = max(ids) if ids else 0
-                    if curr_max > max_id_found: max_id_found = curr_max
-                    
-                    # 3. 检查 Act (动作类型)
-                    # 必须要有 act 字段，且值为 0 或 1
-                    if 'act' in t1: act_counter[t1['act']] += 1
-                    if 'act' in t2: act_counter[t2['act']] += 1
-                    
-                    # 4. 检查 Delta (时间)
-                    if 'delta' not in t1: missing_fields += 1
-                    
-                except json.JSONDecodeError:
-                    print(f"❌ JSON Error at line {i}")
-                    
-    except FileNotFoundError:
-        print(f"❌ File not found: {DATA_PATH}")
+def print_separator(title):
+    print(f"\n{'='*20} {title} {'='*20}")
+
+def inspect_jsonl(filepath, name, num_samples=3):
+    print_separator(f"Inspecting {name}")
+    if not os.path.exists(filepath):
+        print(f"❌ File not found: {filepath}")
         return
 
-    print("\n" + "="*40)
-    print("📊 DATA HEALTH REPORT")
-    print("="*40)
-    print(f"Scanned Lines: {total_lines}")
-    
-    print(f"\n1. ID Range Check:")
-    print(f"   Max ID Found: {max_id_found}")
-    if max_id_found > 250000:
-        print("   ⚠️ WARNING: IDs exceed 250k. 'Modulo' logic in SFT code will be heavily active.")
-        print("   (This is acceptable for Hash Embeddings, but ensure collision is expected.)")
-    else:
-        print("   ✅ IDs are within safe range (<250k).")
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        print(f"✅ Total samples: {len(lines)}")
+        
+        # 随机抽取样本
+        samples = random.sample(lines, min(num_samples, len(lines)))
+        
+        for i, line in enumerate(samples):
+            try:
+                data = json.loads(line)
+                print(f"\n[Sample {i+1}]")
+                
+                # 1. 检查 Instruction
+                inst = data.get('instruction', '')
+                print(f"🔍 Instruction (Raw):\n{repr(inst)}") # 使用 repr 显示换行符等隐形字符
+                
+                # 关键检查点：是否有格式提示？
+                has_trigger = "Response: <" in inst
+                has_format_hint = "semantic ID" in inst or "<c0," in inst
+                
+                print(f"   👉 Contains 'Response: <': {has_trigger}")
+                print(f"   👉 Contains Format Hint:   {has_format_hint}")
+                
+                # 2. 检查 Target
+                meta = data.get('metadata', {})
+                target = meta.get('target_sid')
+                print(f"🎯 Target SID: {target} (Type: {type(target)})")
+                
+            except json.JSONDecodeError:
+                print(f"❌ Line {i} is not valid JSON!")
+    except Exception as e:
+        print(f"❌ Error reading file: {str(e)}")
 
-    print(f"\n2. Outcome Conditioning (Action) Check:")
-    print(f"   Action Distribution: {dict(act_counter)}")
-    if 0 in act_counter and 1 in act_counter:
-        print("   ✅ Good! Both Clicks (0) and Repins (1) detected.")
-    else:
-        print("   ❌ CRITICAL: Missing one type of action! Model cannot learn Outcome Conditioning.")
+def inspect_mapping(filepath):
+    print_separator("Inspecting Mapping File")
+    if not os.path.exists(filepath):
+        print(f"❌ File not found: {filepath}")
+        return
 
-    print(f"\n3. Structure Check:")
-    if missing_fields == 0:
-        print("   ✅ All samples have target_1, target_2, and deltas.")
-    else:
-        print(f"   ❌ Found {missing_fields} samples with missing fields.")
-
-    print("="*40)
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        print(f"✅ Total Items: {len(data)}")
+        
+        # 抽取一个看结构
+        if data:
+            key = next(iter(data))
+            val = data[key]
+            print(f"\n[Sample Item ID: {key}]")
+            print(json.dumps(val, indent=2, ensure_ascii=False))
+            
+            # 检查 full_sid 格式
+            full_sid = val.get('full_sid')
+            print(f"   👉 Full SID format: {full_sid} (Type: {type(full_sid)})")
+    except Exception as e:
+        print(f"❌ Error reading mapping: {str(e)}")
 
 if __name__ == "__main__":
-    inspect_data()
+    inspect_mapping(MAPPING_FILE)
+    inspect_jsonl(TRAIN_DATA, "Train Data (RL Inputs)")
+    inspect_jsonl(TEST_DATA, "Test Data (Eval Inputs)")
