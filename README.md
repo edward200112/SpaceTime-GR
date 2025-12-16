@@ -1151,6 +1151,658 @@ print(recommendations)
 
 ---
 
+## 💻 代码架构总结
+
+### 📦 核心模块组织
+
+#### 1. **数据处理流水线（data_processing/）**
+
+| 文件 | 功能 | 核心实现 |
+|------|------|---------|
+| `step1_build_item_profile.py` | 商家画像构建 | 聚合商家名称、类别、评论、地理位置信息 |
+| `step2_generate_semantic_ids.py` | RQ-VAE 训练与 SID 生成 | BERT 嵌入 + 地理坐标融合 → RQ-VAE 量化 |
+| `step3_build_user_sequences.py` | 用户序列构建 | 时间排序的交互历史 + K-core 过滤 |
+| `step4_construct_prompts.py` | 训练数据构造 | 多任务格式（序列推荐、下一个推荐、相似推荐） |
+| `balance_dataset.py` | 类别平衡采样 | 长尾类别上采样，确保训练数据分布均衡 |
+| `analyze_chain_stores.py` | 连锁店分析 | 识别连锁品牌，分析地理分布模式 |
+
+**关键技术点**：
+```python
+# step2_generate_semantic_ids.py - 地理坐标融合
+def fuse_embeddings_with_geo(embeddings, latitudes, longitudes):
+    """将 768d BERT 嵌入与 2d 地理坐标融合"""
+    scaler = MinMaxScaler()
+    geo_features = scaler.fit_transform(np.column_stack([latitudes, longitudes]))
+    fused = np.concatenate([embeddings, geo_features], axis=1)  # 770d
+    return fused
+
+# step4_construct_prompts.py - 多任务训练格式
+PROMPT_TEMPLATE = """User History:
+{history_items}
+
+Task: Recommend the next business for the user.
+Response: <{c0}, {c1}, {c2}, {suffix}>"""
+```
+
+---
+
+#### 2. **RQ-VAE 核心实现（RQ-VAE/）**
+
+**模型架构（models/rqvae.py）**：
+```python
+class RQVAE(nn.Module):
+    def __init__(self, input_dim=770, hidden_dims=[768, 512, 256], num_layers=4):
+        # Encoder: 770d → 256d
+        self.encoder = Encoder(input_dim, hidden_dims)
+        
+        # 4-Layer Residual Quantization
+        self.quantizers = nn.ModuleList([
+            SinkhornKnoppQuantizer(codebook_size=256, num_codebooks=64)
+            for _ in range(num_layers)
+        ])
+        
+        # Decoder: 256d → 770d
+        self.decoder = Decoder(hidden_dims[::-1], input_dim)
+    
+    def forward(self, x):
+        z = self.encoder(x)  # 770d → 256d
+        
+        # 逐层残差量化
+        quantized = []
+        residual = z
+        for quantizer in self.quantizers:
+            q, indices = quantizer(residual)
+            quantized.append(q)
+            residual = residual - q  # 残差
+        
+        z_q = sum(quantized)  # 重建的量化向量
+        x_recon = self.decoder(z_q)
+        return x_recon, quantized, indices
+```
+
+**训练器（trainer.py）**：
+- **优化器**：Adam (lr=1e-4)
+- **损失函数**：MSE Reconstruction Loss + Commitment Loss
+- **早停机制**：1000 epochs 无改善自动停止
+- **检查点管理**：保存最佳重建损失和最低冲突率两个版本
+
+**Sinkhorn-Knopp 量化器（models/vq.py）**：
+```python
+class SinkhornKnoppQuantizer(nn.Module):
+    """防止 Codebook Collapse 的量化器"""
+    def forward(self, z):
+        # 计算距离矩阵
+        dist = torch.cdist(z, self.codebook)  # (B, N, K)
+        
+        # Sinkhorn-Knopp 算法优化分配
+        Q = sinkhorn_iteration(dist, num_iters=3)
+        
+        # 选择最佳 codebook
+        indices = Q.argmax(dim=-1)
+        quantized = self.codebook[indices]
+        return quantized, indices
+```
+
+---
+
+#### 3. **训练脚本（training/）**
+
+##### **A. HierGR SFT 训练（train_sft_final.py）**
+
+**核心配置**：
+```python
+class SFTConfig:
+    base_model_path = "/workspace/Qwen2_5-1.5B-Instruct"
+    max_seq_length = 1024
+    
+    # LoRA 配置
+    lora_r = 128
+    lora_alpha = 256
+    lora_dropout = 0.05
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", 
+                      "gate_proj", "up_proj", "down_proj"]
+    
+    # 训练参数
+    learning_rate = 2e-4
+    num_train_epochs = 3
+    batch_size = 24
+    warmup_ratio = 0.03
+```
+
+**数据增强**：
+```python
+def augment_history(text):
+    """随机丢弃 1-2 个历史记录，防止过拟合"""
+    history_items = extract_history(text)
+    if len(history_items) > 5:
+        num_drop = random.randint(1, 2)
+        keep_items = random.sample(history_items, len(history_items) - num_drop)
+        return rebuild_prompt(keep_items)
+    return text
+```
+
+**关键特性**：
+- ✅ 动态历史增强（防止重复数据过拟合）
+- ✅ 使用平衡训练集 + 原始验证集
+- ✅ 自动 Checkpoint 管理（保留最新 2 个）
+- ✅ Cosine 学习率调度
+
+---
+
+##### **B. HierGR GRPO 训练（train_grpo_v3.py）**
+
+**三维奖励函数**：
+```python
+def hierarchical_accuracy_reward_func(prompts, completions, target_sid, 
+                                     target_lat, target_lon, **kwargs):
+    """
+    Reward = Format Reward + Semantic Reward + Geo Reward
+    """
+    pred_id = parse_output(completion)  # 解析预测的 SID
+    
+    # 1. Format Reward (基础分)
+    if not pred_id:
+        return -2.0  # 格式错误重罚
+    score = 0.5
+    
+    # 2. Semantic Reward (层级递进)
+    if pred_id[0] == target_sid[0]:  # Layer 0 (Region)
+        score += 0.2
+        if pred_id[1] == target_sid[1]:  # Layer 1 (District)
+            score += 0.3
+            if pred_id[2] == target_sid[2]:  # Layer 2 (Category)
+                score += 1.0
+                if pred_id[3] == target_sid[3]:  # Exact Match
+                    score += 2.0
+    
+    # 3. Geo Reward (距离惩罚)
+    dist_km = haversine(pred_location, target_location)
+    if dist_km <= 1.0:
+        score += 0.5
+    elif dist_km <= 5.0:
+        score += 0.2
+    elif dist_km > 20.0:
+        score -= 0.1
+    
+    return score
+```
+
+**GRPO 配置**：
+```python
+grpo_config = GRPOConfig(
+    learning_rate=1e-6,  # 比 SFT 小 20 倍
+    num_train_epochs=3,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
+    
+    # GRPO 特定参数
+    num_sample_generations=4,  # 每个 prompt 生成 4 个候选
+    temperature=1.2,
+    max_new_tokens=32,
+    
+    # KL 散度控制
+    kl_coef=0.04,  # Beta 参数，防止偏离 reference model 过远
+)
+```
+
+---
+
+##### **C. PinRec 训练（train_pinrec_sft_final.py & train_pinrec_grpo_final.py）**
+
+**模型架构（models/pinrec_ultimate_v2.py）**：
+```python
+class PinRecUltimateV2(nn.Module):
+    def __init__(self, config):
+        # Item Tower: Content + Hash Embedding
+        self.item_tower = ItemTower(config)
+        
+        # User Tower: LLM Backbone + Temporal Encoding
+        self.user_tower = UserTower(config)
+        
+    def forward(self, item_ids, history_ids, history_deltas):
+        # 1. Item Embeddings
+        item_embs = self.item_tower(item_ids)  # (B, N, 1024)
+        
+        # 2. User History Encoding
+        hist_embs = self.item_tower(history_ids)  # (B, H, 1024)
+        time_embs = self.time_encoder(history_deltas)  # (B, H, D)
+        
+        # 3. LLM Encoding
+        combined = torch.cat([hist_embs, time_embs], dim=-1)
+        user_emb = self.user_tower(combined)  # (B, 1024)
+        
+        # 4. Scoring
+        scores = torch.matmul(user_emb, item_embs.transpose(1, 2))
+        return scores
+```
+
+**损失函数**：
+```python
+def compute_loss(scores, positive_indices, negative_indices):
+    # 1. Classification Loss (Softmax)
+    loss_cls = F.cross_entropy(scores, positive_indices)
+    
+    # 2. Pairwise Ranking Loss
+    pos_scores = scores.gather(1, positive_indices.unsqueeze(1))
+    neg_scores = scores.gather(1, negative_indices.unsqueeze(1))
+    loss_pair = F.relu(0.2 - pos_scores + neg_scores).mean()
+    
+    # 3. LogQ Correction (可选)
+    if use_logq:
+        logq_weights = compute_logq_weights(positive_indices)
+        loss_cls = loss_cls * (1 + alpha * logq_weights)
+    
+    return loss_cls + lambda_pair * loss_pair
+```
+
+**关键优化**：
+- ✅ Hash Embedding 避免物品 ID 稀疏性
+- ✅ Time Delta Encoder 捕获时序模式
+- ✅ LogQ 采样偏差修正
+- ✅ LoRA 微调 User Tower 的 LLM Backbone
+
+---
+
+#### 4. **评估系统（inference/ & compare_models_unified.py）**
+
+##### **统一对比框架（compare_models_unified.py）**
+
+**核心流程**：
+```python
+class ModelComparator:
+    def __init__(self, config):
+        # 1. 加载 HierGR (生成式)
+        self.hier_model = HierGRWrapper(config['hier'])
+        
+        # 2. 加载 PinRec (判别式)
+        self.pinrec_model = PinRecWrapper(config['pinrec'])
+        
+        # 3. 建立 ID 映射桥梁
+        self.id_mapper = IDMapper(
+            sid_mapping=config['sid_mapping'],
+            item_profiles=config['item_profiles']
+        )
+    
+    def evaluate(self, test_data, top_k_list):
+        results = {}
+        
+        for model_name, model in [('HierGR', self.hier_model), 
+                                   ('PinRec', self.pinrec_model)]:
+            predictions = []
+            ground_truths = []
+            
+            for sample in tqdm(test_data):
+                # 提取输入
+                prompt = sample['prompt']
+                target_string_id = sample['metadata']['target_1']['id']
+                
+                # 模型预测
+                pred_scores = model.predict(prompt, top_k=max(top_k_list))
+                
+                # ID 映射
+                pred_int_ids = [self.id_mapper.to_int(sid) for sid in pred_scores]
+                truth_int_id = self.id_mapper.to_int(target_string_id)
+                
+                predictions.append(pred_int_ids)
+                ground_truths.append(truth_int_id)
+            
+            # 计算指标
+            results[model_name] = compute_metrics(
+                predictions, ground_truths, top_k_list
+            )
+        
+        return results
+```
+
+**HierGR Wrapper（约束生成）**：
+```python
+class HierGRWrapper:
+    def predict(self, prompt, top_k):
+        # 提取城市信息
+        city = extract_city_from_prompt(prompt)
+        
+        # 加载对应城市的 Trie 树
+        trie = self.city_tries[city]
+        
+        # 约束生成
+        logits_processor = TrieConstraintLogitsProcessor(
+            prompt_length=len(self.tokenizer.encode(prompt)),
+            trie=trie
+        )
+        
+        # Beam Search
+        outputs = self.model.generate(
+            input_ids=input_ids,
+            max_new_tokens=32,
+            num_beams=self.beams,
+            num_return_sequences=top_k,
+            logits_processor=[logits_processor]
+        )
+        
+        # 解析 SID
+        predictions = [parse_sid(o) for o in outputs]
+        return predictions
+```
+
+**指标计算**：
+```python
+def compute_metrics(predictions, ground_truths, top_k_list):
+    metrics = {}
+    
+    for k in top_k_list:
+        # Hit@K
+        hits = [1 if truth in pred[:k] else 0 
+                for pred, truth in zip(predictions, ground_truths)]
+        metrics[f'Hit@{k}'] = np.mean(hits)
+        
+        # NDCG@K
+        ndcgs = []
+        for pred, truth in zip(predictions, ground_truths):
+            if truth in pred[:k]:
+                rank = pred[:k].index(truth) + 1
+                ndcgs.append(1.0 / np.log2(rank + 1))
+            else:
+                ndcgs.append(0.0)
+        metrics[f'NDCG@{k}'] = np.mean(ndcgs)
+    
+    return metrics
+```
+
+---
+
+#### 5. **可视化工具（visualization/）**
+
+##### **Codebook 可视化（visualize_codebook.py）**
+
+```python
+def visualize_codebook_distribution(rqvae_model, sid_mapping):
+    """可视化 RQ-VAE Codebook 的地理分布和类别分布"""
+    
+    # 1. 提取所有 SID 的 Codebook Indices
+    codebook_usage = {layer: Counter() for layer in range(4)}
+    
+    for business_id, meta in sid_mapping.items():
+        sid = meta['full_sid']
+        for layer, code in enumerate(sid):
+            codebook_usage[layer][code] += 1
+    
+    # 2. t-SNE 降维可视化
+    layer0_vectors = rqvae_model.quantizers[0].codebook.weight.detach().cpu()
+    tsne = TSNE(n_components=2)
+    layer0_2d = tsne.fit_transform(layer0_vectors.numpy())
+    
+    # 3. 按城市着色
+    plt.figure(figsize=(12, 8))
+    for city in unique_cities:
+        city_codes = get_city_codes(sid_mapping, city, layer=0)
+        plt.scatter(layer0_2d[city_codes, 0], 
+                   layer0_2d[city_codes, 1], 
+                   label=city, alpha=0.6)
+    plt.legend()
+    plt.title('Layer 0 Codebook Distribution by City')
+    plt.savefig('layer0_city_distribution.png')
+```
+
+---
+
+### 🔧 关键技术实现细节
+
+#### **1. ID 冲突解决机制**
+
+**问题**：3 层 RQ-VAE 产生 98.1% 的 ID 冲突
+
+**解决方案（step2_generate_semantic_ids.py）**：
+```python
+def resolve_collisions(sid_mapping):
+    """添加第 4 层 Unique Suffix 消除冲突"""
+    
+    # 统计每个 Layer2 ID 的冲突数
+    layer2_counter = Counter()
+    for meta in sid_mapping.values():
+        layer2_id = tuple(meta['full_sid'][:3])
+        layer2_counter[layer2_id] += 1
+    
+    # 为冲突 ID 分配 Suffix
+    suffix_map = defaultdict(int)
+    for business_id, meta in sid_mapping.items():
+        layer2_id = tuple(meta['full_sid'][:3])
+        if layer2_counter[layer2_id] > 1:
+            suffix = suffix_map[layer2_id]
+            suffix_map[layer2_id] += 1
+        else:
+            suffix = 0
+        
+        # 更新 full_sid
+        meta['full_sid'] = list(meta['full_sid'][:3]) + [suffix]
+    
+    return sid_mapping
+```
+
+**结果**：冲突率降至 0.0%
+
+---
+
+#### **2. Trie 树约束生成**
+
+**构建 Trie 树（inference/trie_utils.py）**：
+```python
+class Trie:
+    def __init__(self):
+        self.root = {}
+    
+    def insert(self, token_sequence):
+        """插入一个有效的 SID token 序列"""
+        node = self.root
+        for token in token_sequence:
+            if token not in node:
+                node[token] = {}
+            node = node[token]
+        node[-1] = True  # 标记结束
+    
+    def get_next_tokens(self, prefix):
+        """获取给定前缀的所有有效下一个 token"""
+        node = self.root
+        for token in prefix:
+            if token not in node:
+                return None  # 无效前缀
+            node = node[token]
+        return [k for k in node.keys() if k != -1]
+```
+
+**Logits Processor（training/constrained_logits_processor.py）**：
+```python
+class TrieConstraintLogitsProcessor(LogitsProcessor):
+    def __call__(self, input_ids, scores):
+        for i in range(input_ids.shape[0]):
+            # 获取已生成的 token
+            generated = input_ids[i, self.prompt_length:].tolist()
+            
+            # 查询允许的下一个 token
+            allowed = self.trie.get_next_tokens(generated)
+            
+            if allowed is not None:
+                # 屏蔽无效 token
+                mask = torch.ones_like(scores[i], dtype=torch.bool)
+                mask[allowed] = False
+                scores[i] = scores[i].masked_fill(mask, -float('inf'))
+        
+        return scores
+```
+
+---
+
+#### **3. LogQ 采样偏差修正**
+
+**实现（training/train_pinrec_v7_final.py）**：
+```python
+def compute_logq_weights(item_ids, item_frequencies):
+    """
+    LogQ 修正公式：
+    weight_i = log(P(item_i)) / sum_j log(P(item_j))
+    
+    用于调整损失函数，减少对热门物品的过度关注
+    """
+    # 1. 获取物品频率
+    freqs = torch.tensor([item_frequencies.get(i, 1) for i in item_ids])
+    
+    # 2. 计算 log 概率
+    log_probs = torch.log(freqs.float() + 1e-9)
+    
+    # 3. 归一化到 [-1, 0] 区间
+    min_lp = log_probs.min()
+    max_lp = log_probs.max()
+    normalized = (log_probs - min_lp) / (max_lp - min_lp + 1e-9) - 1
+    
+    return normalized
+
+# 应用到损失函数
+loss = classification_loss * (1 + alpha * logq_weights)
+```
+
+**效果**：长尾物品 Hit@10 提升 23.8%
+
+---
+
+### 📊 代码质量与工程实践
+
+#### **1. 配置管理**
+
+所有训练脚本使用统一的配置类：
+```python
+# config/config.yaml
+data:
+  processed_dir: "/workspace/data/processed"
+  max_history_len: 40
+
+rqvae:
+  num_layers: 4
+  codebook_size: 256
+
+llm:
+  model_name: "/workspace/Qwen2_5-1.5B-Instruct"
+  learning_rate: 2e-4
+```
+
+#### **2. 日志与监控**
+
+```python
+# 统一的日志配置
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# 训练过程监控
+for epoch in range(num_epochs):
+    logger.info(f"Epoch {epoch+1}/{num_epochs}")
+    logger.info(f"Loss: {loss:.4f}, Hit@10: {hit10:.4f}")
+    
+    # 自动保存最佳 Checkpoint
+    if hit10 > best_hit10:
+        save_checkpoint(model, f"best_model_epoch{epoch}.pth")
+```
+
+#### **3. 内存管理**
+
+```python
+# 梯度检查点（节省显存）
+model.gradient_checkpointing_enable()
+
+# 混合精度训练
+with autocast(dtype=torch.bfloat16):
+    outputs = model(inputs)
+    loss = criterion(outputs, targets)
+
+# 及时释放缓存
+del intermediate_tensors
+torch.cuda.empty_cache()
+```
+
+#### **4. 错误处理**
+
+```python
+try:
+    predictions = model.generate(prompt)
+except RuntimeError as e:
+    if "out of memory" in str(e):
+        logger.warning("OOM detected, reducing batch size")
+        torch.cuda.empty_cache()
+        # 降低 batch size 重试
+    else:
+        raise e
+```
+
+---
+
+### 🚀 性能优化技巧
+
+#### **1. 数据加载优化**
+
+```python
+# 多进程数据加载
+train_loader = DataLoader(
+    dataset, 
+    batch_size=64, 
+    num_workers=4,  # 并行加载
+    pin_memory=True  # 加速 CPU->GPU 传输
+)
+```
+
+#### **2. 模型并行**
+
+```python
+# DeepSpeed 集成
+from deepspeed import initialize
+
+model, optimizer, _, _ = initialize(
+    model=model,
+    model_parameters=model.parameters(),
+    config="deepspeed_config.json"
+)
+```
+
+#### **3. 推理加速**
+
+```python
+# KV Cache 复用
+with torch.inference_mode():
+    outputs = model.generate(
+        input_ids,
+        use_cache=True,  # 复用 Key-Value Cache
+        num_beams=10
+    )
+```
+
+---
+
+### 📈 代码行数统计
+
+| 模块 | 文件数 | 代码行数 | 功能占比 |
+|------|--------|---------|---------|
+| **data_processing/** | 12 | ~3,500 | 数据处理流水线 |
+| **training/** | 32 | ~8,000 | 训练脚本（SFT + GRPO） |
+| **models/** | 4 | ~1,200 | 模型定义（PinRec + RQ-VAE） |
+| **inference/** | 33 | ~6,500 | 评估与推理工具 |
+| **RQ-VAE/** | 6 | ~2,000 | RQ-VAE 核心实现 |
+| **evaluation/** | 7 | ~1,800 | 评估指标与工具 |
+| **visualization/** | 4 | ~800 | 可视化脚本 |
+| **总计** | **98** | **~24,000** | - |
+
+---
+
+### 🔑 核心代码路径速查
+
+| 功能 | 文件路径 | 说明 |
+|------|---------|------|
+| **RQ-VAE 模型** | `RQ-VAE/models/rqvae.py` | 4 层残差量化 VAE |
+| **SFT 训练** | `training/train_sft_final.py` | HierGR 监督微调 |
+| **GRPO 训练** | `training/train_grpo_v3.py` | 三维奖励函数 RL |
+| **PinRec 模型** | `models/pinrec_ultimate_v2.py` | 双塔判别式推荐 |
+| **统一评估** | `compare_models_unified.py` | HierGR vs PinRec 对比 |
+| **约束生成** | `training/constrained_logits_processor.py` | Trie 树约束 Logits |
+| **语义 ID 生成** | `data_processing/step2_generate_semantic_ids.py` | BERT + Geo + RQ-VAE |
+| **奖励函数** | `training/grpo_rewards_v3.py` | Format + Geo + Semantic |
+
+---
+
 ## 🆕 更新日志
 
 ### v2.1.0 (2024-12-13)
