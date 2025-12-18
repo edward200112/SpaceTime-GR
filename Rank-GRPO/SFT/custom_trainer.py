@@ -2,104 +2,151 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from trl import SFTTrainer
-from transformers import Trainer
+from transformers import TrainerCallback, TrainerState, TrainerControl
+
+# [新增] 课程学习回调：用于更新模型的训练进度状态
+class CurriculumCallback(TrainerCallback):
+    def on_step_begin(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        # 计算当前进度 (0.0 ~ 1.0)
+        current_step = state.global_step
+        max_steps = state.max_steps
+        if max_steps > 0:
+            progress = current_step / max_steps
+        else:
+            progress = 0.0
+        
+        # 将进度注入模型对象，供 compute_loss 使用
+        if hasattr(kwargs['model'], 'curriculum_progress'):
+            kwargs['model'].curriculum_progress = progress
+        else:
+            # 动态绑定属性
+            setattr(kwargs['model'], 'curriculum_progress', progress)
 
 class CoINSFTTrainer(SFTTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # CoIN 参数
         self.contrastive_margin = 0.5
-        self.beta = 0.1 # 对比 Loss 的权重
+        self.lambda_coin = 0.1 
+        # 课程学习参数：前 30% 的步数只学粗粒度
+        self.coarse_stage_ratio = 0.3 
+
+    # [优化] 更加鲁棒的 Pooling 方法，解决 Padding 干扰问题
+    def _masked_mean_pooling(self, hidden_state, attention_mask):
+        """
+        hidden_state: [Batch, Seq, Dim]
+        attention_mask: [Batch, Seq]
+        """
+        mask_expanded = attention_mask.unsqueeze(-1).float() # [B, S, 1]
+        sum_embeddings = torch.sum(hidden_state * mask_expanded, dim=1) # [B, D]
+        sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9) # [B, 1] 防止除零
+        return sum_embeddings / sum_mask
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
-        inputs 包含:
-        - input_ids: 正样本序列 (Prompt + Positive Completion)
-        - attention_mask
-        - labels
-        - ips_weight: 来自 DataCollator 的额外字段 (我们将在 collator 中处理)
-        - negative_input_ids: 负样本序列 (Prompt + Negative Completion) (需自定义处理传入)
+        inputs 扩展字段:
+        - augment_input_ids: CoIN 增强指令 (Prompt B)
+        - hierarchy_mask: 课程学习 Mask (1=Coarse, 0=Fine)
         """
         
-        # 1. 提取额外信息 (IPS 权重 和 负样本)
-        # 注意：HuggingFace 的 Trainer 会自动移除它不认识的列。
-        # 我们需要在 Dataset 中把这些信息 pack 进去，或者使用自定义 DataCollator。
-        # 为了简化实现且不破坏 Trainer 逻辑，我们假设 DataCollator 已经处理好了 inputs 字典。
+        # 1. 提取所有自定义字段
+        ips_weights = inputs.pop("ips_weight", None)
         
-        ips_weights = inputs.pop("ips_weight", None) # [Batch]
+        # CoIN 相关
         neg_input_ids = inputs.pop("negative_input_ids", None) 
         neg_attention_mask = inputs.pop("negative_attention_mask", None)
+        aug_input_ids = inputs.pop("augment_input_ids", None) # [新增] Prompt B
+        aug_attention_mask = inputs.pop("augment_attention_mask", None)
         
-        # 2. 正向传播 (Positive Sample) -> NTP Loss
-        # HuggingFace 模型 forward 默认返回 Causal LM Loss
+        # 课程学习相关
+        hierarchy_mask = inputs.pop("hierarchy_mask", None) 
+
+        # 2. 正向传播 (Prompt A)
         outputs = model(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             labels=inputs["labels"],
-            output_hidden_states=True # 需要 Hidden States 做对比学习
+            output_hidden_states=True 
         )
         
-        # 原始 CrossEntropy Loss (Scalar mean)
-        # 我们需要手动应用 IPS Weight。
-        # 标准 outputs.loss 是已经 mean 过的。为了加权，我们需要取出 logits 手动算。
+        # 3. 计算 NTP Loss (手动计算以应用 IPS 和 Curriculum)
         logits = outputs.logits
         labels = inputs["labels"]
         
-        # Shift for Causal LM
+        # Shift
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         
-        # 计算 Token-level Loss (不 reduce)
         loss_fct = nn.CrossEntropyLoss(reduction='none')
         token_losses = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         token_losses = token_losses.view(shift_labels.size())
         
-        # Mask 掉 padding (labels == -100)
+        # 基础 Mask (去除 Padding)
         padding_mask = (shift_labels != -100).float()
         
-        # 应用 IPS Weight (Sample-level)
-        # ips_weights: [Batch] -> 扩展到 [Batch, Seq]
-        if ips_weights is not None:
-            # 确保在同一设备
-            ips_weights = ips_weights.to(token_losses.device).view(-1, 1)
-            final_token_losses = token_losses * padding_mask * ips_weights
+        # --- [课程学习逻辑] ---
+        # 检查当前进度
+        current_progress = getattr(model, 'curriculum_progress', 1.0)
+        
+        # 如果在第一阶段 (Coarse Stage) 且有层级 Mask
+        if current_progress < self.coarse_stage_ratio and hierarchy_mask is not None:
+            # hierarchy_mask 需要 shift 以对齐 labels
+            # 假设 mask 是 [1, 1, 1, 0, 0] (Prompt+CoT+L1+L2=1, L3+L4=0)
+            shift_hierarchy = hierarchy_mask[..., 1:].contiguous()
+            
+            # 最终 Mask = 非Padding AND 粗粒度允许
+            final_mask = padding_mask * shift_hierarchy
         else:
-            final_token_losses = token_losses * padding_mask
-            
-        ntp_loss = final_token_losses.sum() / padding_mask.sum()
+            # 第二阶段或无 Mask：全量训练
+            final_mask = padding_mask
 
-        # 3. 对比学习 Loss (CoIN)
-        contrastive_loss = 0.0
+        # --- [IPS 加权] ---
+        if ips_weights is not None:
+            ips_weights = ips_weights.to(token_losses.device).view(-1, 1)
+            weighted_losses = token_losses * final_mask * ips_weights
+        else:
+            weighted_losses = token_losses * final_mask
+            
+        ntp_loss = weighted_losses.sum() / (final_mask.sum() + 1e-9)
+
+        # 4. CoIN 对比损失 (Consistency + Negative)
+        contrastive_loss = torch.tensor(0.0, device=ntp_loss.device)
+        
+        # 获取 Prompt A 的表征 (Anchor)
+        # 使用优化的 Masked Mean Pooling
+        pos_hidden = outputs.hidden_states[-1]
+        pos_repr = self._masked_mean_pooling(pos_hidden, inputs["attention_mask"])
+
+        # A. 一致性 Loss (Prompt A vs Prompt B)
+        if aug_input_ids is not None:
+            aug_outputs = model(
+                input_ids=aug_input_ids,
+                attention_mask=aug_attention_mask,
+                output_hidden_states=True
+            )
+            aug_hidden = aug_outputs.hidden_states[-1]
+            aug_repr = self._masked_mean_pooling(aug_hidden, aug_attention_mask)
+            
+            # Maximize Similarity => Minimize (1 - Cosine)
+            consistency_loss = 1.0 - F.cosine_similarity(pos_repr, aug_repr).mean()
+            contrastive_loss += consistency_loss
+
+        # B. 负样本 Loss (Prompt A vs Negative Item)
         if neg_input_ids is not None:
-            # 获取 Positive 的 EOS token 之前的 hidden state (代表整个序列的语义)
-            # 简单起见，取最后一个 hidden state
-            # outputs.hidden_states 是一个 tuple，取最后一层 [-1]
-            pos_hidden = outputs.hidden_states[-1] # [Batch, Seq, Dim]
-            
-            # 获取序列最后一个有效 token 的向量 (使用 attention_mask)
-            # pos_last_idx = inputs["attention_mask"].sum(dim=1) - 1
-            # pos_repr = pos_hidden[torch.arange(pos_hidden.size(0)), pos_last_idx]
-            # 为了计算方便，取 mean pooling 或者 max pooling
-            pos_repr = torch.mean(pos_hidden, dim=1) 
-
-            # 前向传播 Negative Sample (No Gradients needed for negative encoder usually, but here we train single model)
-            # 我们希望模型认为 Negative Sample 的概率低，或者其 Embedding 离 Positive 远
             neg_outputs = model(
                 input_ids=neg_input_ids,
                 attention_mask=neg_attention_mask,
                 output_hidden_states=True
             )
             neg_hidden = neg_outputs.hidden_states[-1]
-            neg_repr = torch.mean(neg_hidden, dim=1)
+            neg_repr = self._masked_mean_pooling(neg_hidden, neg_attention_mask)
             
-            # 计算 Cosine Similarity
-            sim = F.cosine_similarity(pos_repr, neg_repr)
-            
-            # Loss = max(0, sim - margin)
-            # 如果相似度 > margin，产生 Loss，强迫拉远
-            contrastive_loss = torch.mean(torch.clamp(sim - self.contrastive_margin, min=0))
+            # Hinge Loss: Push away if similarity > margin
+            sim_neg = F.cosine_similarity(pos_repr, neg_repr)
+            neg_loss = torch.mean(torch.clamp(sim_neg - self.contrastive_margin, min=0))
+            contrastive_loss += neg_loss
 
-        # 4. 总 Loss
-        total_loss = ntp_loss + self.beta * contrastive_loss
+        # 5. 总 Loss
+        total_loss = ntp_loss + self.lambda_coin * contrastive_loss
         
         return (total_loss, outputs) if return_outputs else total_loss

@@ -48,7 +48,7 @@ data/embeddings/*
 data/rqvae_ckpt/*
 data/llm_ckpt/*
 !data/.gitkeep
-
+Rank-GRPO/SFT/sft_data/
 # Logs
 logs/
 *.log
