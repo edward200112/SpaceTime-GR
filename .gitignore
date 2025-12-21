@@ -19,6 +19,12 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+data/
+PinRec/
+HierGR/
+backup/
+data/processed_pinrec/*.npy
+data/processed_pinrec/
 
 # Virtual Environment
 venv/
@@ -32,13 +38,17 @@ ENV/
 *.swo
 
 # Data
+GoogleRAW/
+processed_data/
+Qwen2_5-1.5B-Instruct/
+data/
 data/raw/*
 data/processed/*
 data/embeddings/*
 data/rqvae_ckpt/*
 data/llm_ckpt/*
 !data/.gitkeep
-
+Rank-GRPO/SFT/sft_data/
 # Logs
 logs/
 *.log
