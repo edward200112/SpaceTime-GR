@@ -1,96 +1,68 @@
 import os
-import json
 import random
 from tqdm import tqdm
 
 # ================= 配置 =================
-DATA_DIR = "./SFT/sft_data"
-# 最终输出文件
-OUTPUT_FILE = os.path.join(DATA_DIR, "sft_balanced_train.jsonl")
+OUTPUT_DIR = "./SFT/sft_data"
+OUTPUT_FILE = os.path.join(OUTPUT_DIR, "sft_balanced_train.jsonl")
+TARGET_SAMPLES_PER_REGION = 300000 
 
-# 均衡采样参数：每个地区最多保留 30万 条
-# (如果该地区数据不够 30万，则全部保留)
-TARGET_SAMPLES_PER_REGION = 300000
+# 定义文件列表 (和之前一致)
+REGION_NAMES = ["California", "New_York", "New_Mexico", "Pennsylvania", "Unknown"]
 
-def merge_and_balance():
-    print(f"🚀 Starting Phase 5 (Manual Resume)...")
-    print(f"📂 Scanning {DATA_DIR} for temp files...")
-
-    # 1. 自动寻找所有 temp_*.jsonl 文件
-    # 你的目录下有: temp_California.jsonl, temp_New_York.jsonl 等
-    temp_files = [f for f in os.listdir(DATA_DIR) if f.startswith("temp_") and f.endswith(".jsonl")]
+def reservoir_sampling(file_path, k):
+    """
+    蓄水池采样：从巨大的文件中随机抽取 k 行，内存占用恒定为 O(k)
+    """
+    sample = []
+    print(f"   Streaming {os.path.basename(file_path)}...")
     
-    if not temp_files:
-        print("❌ No temp files found! Please check the directory.")
-        return
+    with open(file_path, 'r') as f:
+        # 1. 先填满池子
+        for i, line in enumerate(f):
+            if i < k:
+                sample.append(line)
+            else:
+                # 2. 之后的每一行，以 k/(i+1) 的概率替换池子里的元素
+                j = random.randint(0, i)
+                if j < k:
+                    sample[j] = line
+            
+            # 打印进度 (每处理 100万行 打印一次，防止刷屏)
+            if (i + 1) % 1000000 == 0:
+                print(f"     Processed {i/1000000:.1f}M lines...", end='\r')
+    
+    print(f"\n     Selected {len(sample)} lines from {os.path.basename(file_path)}.")
+    return sample
 
-    print(f"   Found {len(temp_files)} files: {temp_files}")
+def main():
+    print("🚀 Starting Recovery Merge (Memory Safe Mode)...")
     
     final_samples = []
-    total_raw_count = 0
-
-    # 2. 遍历处理每个地区文件
-    for file_name in temp_files:
-        file_path = os.path.join(DATA_DIR, file_name)
-        # 从文件名提取地区名，例如 temp_California.jsonl -> California
-        region_name = file_name.replace("temp_", "").replace(".jsonl", "")
-        
-        print(f"\nProcessing Region: {region_name} ...")
-        
-        valid_lines = []
-        try:
-            with open(file_path, 'r') as f:
-                # 逐行读取并校验 JSON (防止上次中断导致最后一行损坏)
-                for line in f:
-                    line = line.strip()
-                    if not line: continue
-                    try:
-                        # 尝试解析，确保数据完整
-                        # (虽然这步会慢一点，但为了安全是值得的)
-                        json.loads(line)
-                        valid_lines.append(line)
-                    except json.JSONDecodeError:
-                        # 忽略损坏的行
-                        continue
-        except Exception as e:
-            print(f"   ⚠️ Error reading {file_name}: {e}")
-            continue
-        
-        count = len(valid_lines)
-        total_raw_count += count
-        print(f"   - Raw Count: {count}")
-
-        # 3. 打乱该地区数据 (Shuffle)
-        random.shuffle(valid_lines)
-
-        # 4. 均衡截断 (Subsample)
-        if count > TARGET_SAMPLES_PER_REGION:
-            kept_lines = valid_lines[:TARGET_SAMPLES_PER_REGION]
-            print(f"   - ✂️ Subsampled to: {len(kept_lines)}")
-        else:
-            kept_lines = valid_lines
-            print(f"   - ✅ Kept All ({count} < {TARGET_SAMPLES_PER_REGION})")
-        
-        final_samples.extend(kept_lines)
-
-    # 5. 最终全局打乱 (Global Shuffle)
-    print(f"\n🎲 Final Global Shuffle of {len(final_samples)} merged samples...")
-    random.shuffle(final_samples)
-
-    # 6. 写入最终结果
-    print(f"💾 Saving to {OUTPUT_FILE}...")
-    with open(OUTPUT_FILE, 'w') as f:
-        for line in tqdm(final_samples):
-            f.write(line + "\n")
-
-    print("\n✅ Success! Dataset is ready.")
-    print(f"   Total Raw Data: {total_raw_count}")
-    print(f"   Final Balanced Data: {len(final_samples)}")
     
-    # 7. (可选) 清理临时文件
-    # print("🧹 Cleaning up temp files...")
-    # for f in temp_files:
-    #     os.remove(os.path.join(DATA_DIR, f))
+    for r_name in REGION_NAMES:
+        temp_path = os.path.join(OUTPUT_DIR, f"temp_{r_name}.jsonl")
+        
+        if not os.path.exists(temp_path):
+            print(f"⚠️ Warning: {temp_path} not found, skipping.")
+            continue
+            
+        print(f"Processing Region: {r_name}")
+        
+        # 使用蓄水池采样，而不是 readlines()
+        # 这样即使 California 有 4600万行，内存也只存 30万行
+        region_samples = reservoir_sampling(temp_path, TARGET_SAMPLES_PER_REGION)
+        final_samples.extend(region_samples)
+
+    print(f"🎲 Final Global Shuffle of {len(final_samples)} samples...")
+    random.shuffle(final_samples)
+    
+    print(f"💾 Saving Balanced Data to {OUTPUT_FILE}...")
+    with open(OUTPUT_FILE, 'w') as f:
+        f.writelines(final_samples)
+        
+    print("✅ Merge Completed Successfully!")
+    print("🧹 (Optional) You can now delete the temp_*.jsonl files to free space.")
 
 if __name__ == "__main__":
-    merge_and_balance()
+    main()

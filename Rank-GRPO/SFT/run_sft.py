@@ -1,122 +1,144 @@
 import torch
 import os
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
-from custom_trainer import CoINSFTTrainer, CurriculumCallback # [修改] 导入 Callback
+# [修改 1] 必须用 SFTConfig 适配 TRL v0.12+
+from trl import SFTConfig
+from custom_trainer import CoINSFTTrainer, CurriculumCallback 
 
 # ================= 配置 =================
 MODEL_ID = "/workspace/Qwen2_5-1.5B-Instruct"
 DATA_FILE = "./SFT/sft_data/sft_balanced_train.jsonl"
-OUTPUT_DIR = "./SFT/sft_output"
+OUTPUT_DIR = "./SFT/sft_output_coin" 
 
 def format_instruction(sample, completion_key="completion"):
-    # ChatML 格式
     return f"<|im_start|>user\n{sample['prompt']}<|im_end|>\n<|im_start|>assistant\n{sample[completion_key]}<|im_end|>"
 
 def format_augment_instruction(sample):
-    # CoIN 增强 Prompt
     return f"<|im_start|>user\n{sample['prompt_augment']}<|im_end|>\n<|im_start|>assistant\n{sample['completion']}<|im_end|>"
 
 def format_negative_instruction(sample):
-    # 负样本 (注意：负样本只需 Completion 部分做 Embedding 对比，但为了通过模型Forward，通常给完整Prompt)
     return f"<|im_start|>user\n{sample['prompt']}<|im_end|>\n<|im_start|>assistant\n{sample['negative_completion']}<|im_end|>"
 
 def main():
+    print(f"🔄 Initializing...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right" 
 
     print(f"Loading data from {DATA_FILE}...")
-    dataset = load_dataset("json", data_files=DATA_FILE, split="train")
+    # [修改 2] 加载完整数据集
+    full_dataset = load_dataset("json", data_files=DATA_FILE, split="train")
 
-    # 3. 增强版预处理函数
+    # [修改 3] 切分验证集 (只取 200 条作为 Eval，保证速度)
+    # 使用 seed=42 保证每次跑都切出一样的数据
+    print("✂️ Splitting dataset for evaluation...")
+    split_dataset = full_dataset.train_test_split(test_size=200, seed=42)
+    train_dataset = split_dataset['train']
+    eval_dataset = split_dataset['test']
+    
+    print(f"   Train size: {len(train_dataset)}")
+    print(f"   Eval size:  {len(eval_dataset)} (Partial sampling for speed)")
+
+    # ================= 高级 Mask 预处理 =================
     def preprocess_function(examples):
-        # ----------------------------------
-        # A. 正样本 (Prompt A + Completion)
-        # ----------------------------------
+        # A. 正样本
         texts = [
             format_instruction({"prompt": p, "completion": c}, "completion") 
             for p, c in zip(examples['prompt'], examples['completion'])
         ]
         model_inputs = tokenizer(texts, max_length=1024, padding="max_length", truncation=True)
-        
-        # 构造 Labels (Auto-regressive)
         labels = model_inputs["input_ids"].copy()
         
-        # [优化] 构造 Hierarchy Mask (用于课程学习)
-        # 逻辑：CoT部分=1, ID前2层=1, ID后2层=0 (在早期阶段)
-        # 注意：examples['raw_target_code'] 是 "12 34 56 78"
+        # --- Hierarchy Mask (子序列匹配逻辑) ---
         hierarchy_masks = []
+        raw_codes = examples.get('raw_target_code', [None] * len(labels))
         
-        for i, raw_code in enumerate(examples['raw_target_code']):
-            # 默认全开启
-            mask = [1] * len(labels[i])
+        for i, raw_code in enumerate(raw_codes):
+            mask = [1] * len(labels[i]) # 默认全看
             
-            # 找到 ID 在序列中的位置
-            # raw_code 格式: "12 34 56 78" -> Tokenizer 后可能会变成多个 token
-            # 这是一个简化的启发式查找：在 labels 中倒数寻找 ID 的 token
-            # 为了准确，我们假设 ID 是序列的结尾 (CoT -> Target: ID)
-            
-            try:
-                # 将 raw code split 成 4 段: ["12", "34", "56", "78"]
-                code_parts = raw_code.split() 
-                if len(code_parts) == 4:
-                    # 找到最后两个部分 ("56", "78") 的 token 位置并设为 0
-                    # 注意：Tokenization 可能会加空格前缀，这里做简单处理
-                    # 获取最后几个非 padding token
-                    valid_len = sum(model_inputs["attention_mask"][i])
-                    
-                    # 假设 ID 约占最后 4-8 个 token (取决于 tokenizer 分词粒度)
-                    # 简单策略：将最后 2-3 个 token 视为 Fine-grained ID 并 Mask
-                    # 更严谨的做法是对 code_parts[-2:] 进行 tokenize 并匹配，这里取近似值：
-                    # Qwen Tokenizer 对数字处理较好。
-                    # 我们Mask掉最后 2 个有效 token (通常对应 56 78)
-                    mask[valid_len-2 : valid_len] = [0, 0] 
-            except:
-                pass # 格式不对则不 Mask
-                
+            if raw_code:
+                try:
+                    # 假设 raw_code: "12 34 56 78"
+                    code_parts = raw_code.split() 
+                    if len(code_parts) == 4:
+                        # 我们要 Mask 掉 " 56 78" (Level 3 & 4)
+                        fine_grained_suffix = f" {code_parts[2]} {code_parts[3]}"
+                        
+                        target_tokens = tokenizer.encode(fine_grained_suffix, add_special_tokens=False)
+                        len_tgt = len(target_tokens)
+                        
+                        if len_tgt > 0:
+                            valid_len = sum(model_inputs["attention_mask"][i])
+                            search_start = max(0, valid_len - 30)
+                            search_window = labels[i][search_start : valid_len]
+                            
+                            match_index = -1
+                            for k in range(len(search_window) - len_tgt, -1, -1):
+                                if search_window[k : k + len_tgt] == target_tokens:
+                                    match_index = search_start + k
+                                    break
+                            
+                            if match_index != -1:
+                                mask[match_index : match_index + len_tgt] = [0] * len_tgt
+                except Exception:
+                    pass
             hierarchy_masks.append(mask)
+        # -----------------------------------------------
 
-        # 处理 Labels 中的 Padding
         for i in range(len(labels)):
-            labels[i] = [
-                -100 if t == tokenizer.pad_token_id else t for t in labels[i]
-            ]
+            labels[i] = [-100 if t == tokenizer.pad_token_id else t for t in labels[i]]
         
         model_inputs["labels"] = labels
         model_inputs["hierarchy_mask"] = hierarchy_masks
 
-        # ----------------------------------
-        # B. 增强样本 (Prompt B, CoIN)
-        # ----------------------------------
-        aug_texts = [
-            format_augment_instruction({"prompt_augment": pa, "completion": c}) 
-            for pa, c in zip(examples['prompt_augment'], examples['completion'])
-        ]
-        aug_inputs = tokenizer(aug_texts, max_length=1024, padding="max_length", truncation=True)
-        model_inputs["augment_input_ids"] = aug_inputs["input_ids"]
-        model_inputs["augment_attention_mask"] = aug_inputs["attention_mask"]
+        # B. 增强样本
+        if 'prompt_augment' in examples:
+            aug_texts = [
+                format_augment_instruction({"prompt_augment": pa, "completion": c}) 
+                for pa, c in zip(examples['prompt_augment'], examples['completion'])
+            ]
+            aug_inputs = tokenizer(aug_texts, max_length=1024, padding="max_length", truncation=True)
+            model_inputs["augment_input_ids"] = aug_inputs["input_ids"]
+            model_inputs["augment_attention_mask"] = aug_inputs["attention_mask"]
+        else:
+             model_inputs["augment_input_ids"] = [[]] * len(texts)
+             model_inputs["augment_attention_mask"] = [[]] * len(texts)
 
-        # ----------------------------------
-        # C. 负样本 (Prompt A + Negative Item)
-        # ----------------------------------
-        neg_texts = [
-            format_negative_instruction({"prompt": p, "negative_completion": nc}) 
-            for p, nc in zip(examples['prompt'], examples['negative_completion'])
-        ]
-        neg_inputs = tokenizer(neg_texts, max_length=1024, padding="max_length", truncation=True)
-        model_inputs["negative_input_ids"] = neg_inputs["input_ids"]
-        model_inputs["negative_attention_mask"] = neg_inputs["attention_mask"]
+        # C. 负样本
+        if 'negative_completion' in examples:
+            neg_texts = [
+                format_negative_instruction({"prompt": p, "negative_completion": nc}) 
+                for p, nc in zip(examples['prompt'], examples['negative_completion'])
+            ]
+            neg_inputs = tokenizer(neg_texts, max_length=1024, padding="max_length", truncation=True)
+            model_inputs["negative_input_ids"] = neg_inputs["input_ids"]
+            model_inputs["negative_attention_mask"] = neg_inputs["attention_mask"]
         
-        # D. IPS 权重
-        model_inputs["ips_weight"] = examples["ips_weight"]
+        if 'ips_weight' in examples:
+            model_inputs["ips_weight"] = examples["ips_weight"]
         
         return model_inputs
 
-    print("Tokenizing dataset...")
-    # remove_columns 很重要，防止内存溢出和格式错误
-    tokenized_dataset = dataset.map(preprocess_function, batched=True, remove_columns=dataset.column_names)
+    print("⚡ Tokenizing Train dataset...")
+    train_tokenized = train_dataset.map(
+        preprocess_function, 
+        batched=True, 
+        num_proc=16, 
+        remove_columns=train_dataset.column_names,
+        desc="Tokenizing Train"
+    )
+
+    # [修改 4] 对验证集也做 Tokenize
+    print("⚡ Tokenizing Eval dataset...")
+    eval_tokenized = eval_dataset.map(
+        preprocess_function, 
+        batched=True, 
+        num_proc=4, # 数据少，4核够了
+        remove_columns=eval_dataset.column_names,
+        desc="Tokenizing Eval"
+    )
 
     # 4. 加载模型
     print("Loading Model...")
@@ -124,7 +146,8 @@ def main():
         MODEL_ID, 
         torch_dtype=torch.float16, 
         device_map="auto",
-        trust_remote_code=True
+        trust_remote_code=True,
+        attn_implementation="flash_attention_2" 
     )
     
     peft_config = LoraConfig(
@@ -136,28 +159,42 @@ def main():
     model.print_trainable_parameters()
 
     # 5. 训练参数
-    training_args = TrainingArguments(
+    training_args = SFTConfig(
         output_dir=OUTPUT_DIR,
-        num_train_epochs=3,
-        per_device_train_batch_size=4, 
-        gradient_accumulation_steps=4,
+        num_train_epochs=2,
+        per_device_train_batch_size=4,   
+        gradient_accumulation_steps=2,
+        dataloader_num_workers=0,        
+        group_by_length=False,           
+        
         learning_rate=2e-5,
         fp16=True,
+        
+        # [修改 5] 开启评估策略
+        eval_strategy="steps",       # 按步数评估
+        eval_steps=1000,             # 每 1000 步评估一次
+        per_device_eval_batch_size=4, # 验证集 Batch Size
+        
+        save_strategy="steps",
+        save_steps=1000,
+        save_total_limit=3,
         logging_steps=50,
-        save_strategy="epoch",
-        remove_unused_columns=False, # 必须保留自定义列
-        report_to="none"
+        
+        remove_unused_columns=False,
+        report_to="none",
+        
+        dataset_kwargs={"skip_prepare_dataset": True}
     )
 
     # 6. 初始化 Trainer
     trainer = CoINSFTTrainer(
         model=model,
-        train_dataset=tokenized_dataset,
+        train_dataset=train_tokenized,
+        # [修改 6] 传入验证集
+        eval_dataset=eval_tokenized, 
         args=training_args,
-        tokenizer=tokenizer,
-        packing=False,
-        max_seq_length=1024,
-        callbacks=[CurriculumCallback()] # [新增] 注册回调
+        processing_class=tokenizer,
+        callbacks=[CurriculumCallback()] 
     )
 
     print("🚀 Starting CoIN-SFT Training...")
