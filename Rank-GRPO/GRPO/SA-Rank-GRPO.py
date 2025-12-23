@@ -154,7 +154,7 @@ class DataManager:
         d_k_km = dist[0][-1] * 6371.0
         return max(alpha * d_k_km, 0.1)
 
-# ================= 2. 奖励系统 =================
+# ================= 2. 奖励系统 (核心修改区域) =================
 class RewardSystem:
     def __init__(self, dm: DataManager, config: SARankConfig):
         self.dm = dm
@@ -207,9 +207,10 @@ class RewardSystem:
             elif len(pred_parts)>=1 and len(gt_parts)>=1 and pred_parts[0] == gt_parts[0]:
                 r_rel = 0.1
 
-            # B. Spatial
+            # B. Spatial [关键修改：解开了 r_rel 的锁]
             r_geo = 0.0
-            if r_rel > self.cfg.semantic_threshold and user_loc and pred_info:
+            # 只要生成的 ID 是个有效的 POI (pred_info 存在)，就计算距离奖励！
+            if user_loc and pred_info: 
                 dist = self.haversine_km(user_loc, pred_info['loc'])
                 h_u = self.dm.get_bandwidth_h(user_loc[0], user_loc[1], k=self.cfg.kde_k, alpha=self.cfg.kde_alpha)
                 r_geo = math.exp(-(dist**2)/(2*h_u**2))
@@ -254,14 +255,13 @@ class RewardSystem:
             if info: return info['loc']
         return None
 
-# ================= 3. SA-Rank Trainer (修正版) =================
+# ================= 3. SA-Rank Trainer =================
 class SARankTrainer(Trainer):
     def __init__(self, reward_system: RewardSystem, ref_model, **kwargs):
         super().__init__(**kwargs)
         self.rs = reward_system
         self.sa_cfg = kwargs.get('args')
         self.ref_model = ref_model 
-        # [新增] 用于存储评估期间的奖励数据
         self.eval_metrics_buffer = defaultdict(list)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -272,16 +272,12 @@ class SARankTrainer(Trainer):
 
         G = self.sa_cfg.num_generations
         
-        # =================== 1. 混合模式生成 (解决速度慢) ===================
-        # 如果当前是训练模式，则切到 eval 做生成，否则保持 eval
         was_training = model.training
         model.eval()
         
-        # 临时保存状态
         original_use_cache = model.config.use_cache
         original_gc_enabled = model.is_gradient_checkpointing
         
-        # 【关键操作】生成时：开启 Cache，关闭 Checkpointing
         model.config.use_cache = True 
         if original_gc_enabled:
             model.gradient_checkpointing_disable()
@@ -301,7 +297,6 @@ class SARankTrainer(Trainer):
                 use_cache=True 
             )
             
-        # [DEBUG] 打印监控
         if self.state.global_step % 50 == 0 and was_training: 
             temp_text = self.processing_class.decode(generation_output[0], skip_special_tokens=True)
             gen_len = len(generation_output[0]) - repeated_prompt_ids.shape[1]
@@ -310,37 +305,31 @@ class SARankTrainer(Trainer):
         
         torch.cuda.synchronize() 
             
-        # 【关键操作】恢复现场
         model.config.use_cache = False
         if original_gc_enabled:
             model.gradient_checkpointing_enable()
         
-        # 恢复原来的模式
         if was_training:
             model.train()
         else:
             model.eval()
         
-        # 重新挂载梯度钩子
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         else:
             model.get_input_embeddings().requires_grad_(True)
             
-        # =================== 2. 训练计算 ===================
         full_ids = generation_output
         full_mask = (full_ids != self.processing_class.pad_token_id).long()
         
-        # Labels setup
         labels = full_ids.clone()
         prompt_len = repeated_prompt_ids.shape[1]
         labels[:, :prompt_len] = -100 
         labels[full_ids == self.processing_class.pad_token_id] = -100
 
-        # --- Policy Forward ---
         outputs = model(input_ids=full_ids, attention_mask=full_mask)
         logits = outputs.logits 
-        del outputs # 显存优化
+        del outputs
 
         shift_logits = logits[:, :-1, :]
         shift_labels = labels[:, 1:]
@@ -354,9 +343,8 @@ class SARankTrainer(Trainer):
         completion_mask = (shift_labels != -100).float()
         per_token_logps = per_token_logps * completion_mask
 
-        del logits, shift_logits # 显存优化
+        del logits, shift_logits
         
-        # --- Reference Forward ---
         with torch.no_grad():
             if self.ref_model.device != model.device:
                 self.ref_model = self.ref_model.to(model.device)
@@ -373,7 +361,6 @@ class SARankTrainer(Trainer):
             ref_per_token_logps = ref_per_token_logps * completion_mask
             del ref_outputs, ref_logits
 
-        # =================== 3. GRPO Loss & Metrics ===================
         reward_inputs = {
             "input_ids": full_ids,
             "prompts_text": prompts_text,
@@ -381,7 +368,6 @@ class SARankTrainer(Trainer):
         }
         advantages, stats = self.compute_sa_advantages(reward_inputs)
         
-        # [关键] 记录评估指标
         if not model.training:
             for k, v in stats.items():
                 self.eval_metrics_buffer[k].append(v)
@@ -393,7 +379,6 @@ class SARankTrainer(Trainer):
         
         ratio = torch.exp(per_token_logps - ref_per_token_logps)
         
-        # PPO Clipping
         epsilon_clip = 0.2
         surr1 = ratio * per_token_advantages
         surr2 = torch.clamp(ratio, 1.0 - epsilon_clip, 1.0 + epsilon_clip) * per_token_advantages
@@ -406,12 +391,8 @@ class SARankTrainer(Trainer):
         if self.state.global_step % 50 == 0 and model.training:
             print(f"  [Stats] Ratio Max: {ratio.max().item():.2f}, Adv Max: {per_token_advantages.max().item():.2f}")
 
-        # ================= [修复] 适配 Trainer 的评估接口 =================
         if return_outputs:
-            # 返回 dummy tensor 而不是 None，防止 'NoneType' object is not subscriptable 报错
-            # 虽然 prediction_loss_only=True 应该忽略它，但有些版本的 Trainer 依然会先切片
-            return loss, loss.unsqueeze(0) # 返回一个 dummy tensor
-        # ==============================================================
+            return loss, loss.unsqueeze(0)
         
         return loss
 
@@ -436,7 +417,6 @@ class SARankTrainer(Trainer):
         gt_codes_expanded = np.repeat(gt_codes, G).tolist()
         prompts_expanded = np.repeat(prompts_text, G).tolist()
         
-        # 调用奖励系统
         r_rel, r_geo, r_div, r_pop, r_consist, r_dense, w_ips = self.rs.calc_rewards(
             prompts_expanded, completions, pred_codes, gt_codes_expanded
         )
@@ -498,7 +478,7 @@ class SARankTrainer(Trainer):
         self.log(custom_metrics)
         return output
 
-# ================= 4. 自定义 Collator (修正版) =================
+# ================= 4. 自定义 Collator =================
 @dataclass
 class SADataCollator:
     tokenizer: Any
@@ -520,7 +500,6 @@ class SADataCollator:
             mask_flipped, batch_first=True, padding_value=0
         )
         
-        # [修复] 先定义变量，避免 NameError
         final_input_ids = padded_ids_flipped.flip(1)
         final_attention_mask = padded_mask_flipped.flip(1)
         
@@ -528,37 +507,39 @@ class SADataCollator:
             "input_ids": final_input_ids,
             "attention_mask": final_attention_mask,
             "prompts_text": prompts_text,
-            "gt_codes": gt_codes,   # [修复] 补上逗号
+            "gt_codes": gt_codes,   
             "labels": final_input_ids.clone() 
         }
         return batch
 
 # ================= 5. Main =================
 def main():
+    # 1. 核心配置: Stage 2
     cfg = SARankConfig(
-        output_dir="./GRPO/output_sarank",
+        output_dir="./GRPO/output_sarank_stage2", # [修改] 避免覆盖 Stage 1
         remove_unused_columns=False,
         num_generations=4, 
         per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+
         gradient_accumulation_steps=8,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
-        per_device_eval_batch_size=1,  # <--- 默认是8，会导致显存爆炸！
+        
         eval_strategy="steps",
-        eval_steps=100,
+        eval_steps=5,
         save_strategy="steps",
         save_steps=100,
         save_total_limit=2,
         logging_steps=5,
-        max_steps=1000,
+        max_steps=1000, # [修改] Stage 2 不用跑太久，500步足够观察效果
         load_best_model_at_end=True,
         metric_for_best_model="loss",
         
-        # [关键] 安全的超参数
-        learning_rate=1e-6, 
+        # [关键] 降低学习率，微调 ckpt800
+        learning_rate=5e-7,  
         warmup_ratio=0.1,
         
-        # [关键] 防止评估报错
         prediction_loss_only=True,
         max_grad_norm=1.0,
     )
@@ -566,25 +547,28 @@ def main():
     dm = DataManager(cfg)
     rs = RewardSystem(dm, cfg)
 
-    base_model_path = "/workspace/Qwen2_5-1.5B-Instruct"
+    # [修改] 直接加载 Stage 1 训练好的合并模型作为 Policy
+    base_model_path = "/workspace/Rank-GRPO/GRPO/output_sarank/checkpoint-800"
+    
+    # 原始 Base 模型路径 (仅用于 tokenizer 和 Ref Model 的初始化)
+    original_base_path = "/workspace/Qwen2_5-1.5B-Instruct"
+    # SFT Adapter 路径 (用于 Ref Model)
     sft_adapter_path = "/workspace/Rank-GRPO/SFT/sft_output_coin/checkpoint-44000"
-    tokenizer = AutoTokenizer.from_pretrained(base_model_path)
+    
+    print(f"🔄 Loading Tokenizer from {base_model_path}...")
+    tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
     tokenizer.padding_side = "left"
     if not tokenizer.pad_token: tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"🔄 Loading Models...")
+    # 1. 加载 Policy Model (使用 ckpt800)
+    print(f"🔄 Loading Policy Model from {base_model_path}...")
     model = AutoModelForCausalLM.from_pretrained(
         base_model_path,
         dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True
     )
-
-    if os.path.exists(sft_adapter_path):
-        print("   ✅ Loading SFT Adapter (Policy)...")
-        model = PeftModel.from_pretrained(model, sft_adapter_path)
-        print("   🔄 Merging SFT adapter into base model...")
-        model = model.merge_and_unload()
+    # 注意：这里不需要再加载 SFT adapter，因为 ckpt800 已经是 merge 过的了
 
     print("   🛑 Gradient Checkpointing DISABLED for speed (VRAM is sufficient).")
     model.gradient_checkpointing_disable() 
@@ -600,14 +584,17 @@ def main():
     for param in model.parameters():
         param.requires_grad = True
 
-    print("   ❄️ Loading Reference Model (Frozen)...")
+    # 2. 加载 Reference Model (使用 Original Base + SFT Adapter)
+    #    这样 KL 约束的是让模型不要偏离 SFT 太多
+    print("   ❄️ Loading Reference Model (Original Base + SFT)...")
     ref_model = AutoModelForCausalLM.from_pretrained(
-        base_model_path,
+        original_base_path, # 用原始 Qwen
         dtype=torch.bfloat16,
         device_map="cuda:0",
         trust_remote_code=True
     )
     if os.path.exists(sft_adapter_path):
+        print("     + Loading SFT Adapter for Reference...")
         ref_model = PeftModel.from_pretrained(ref_model, sft_adapter_path)
         ref_model = ref_model.merge_and_unload()
     ref_model.eval()
@@ -619,12 +606,11 @@ def main():
         train_ds = dataset_dict["train"]
         eval_ds = dataset_dict["test"]
     else:
-        # 这里的 map 逻辑需要你原有代码支持，如果 cache 存在则不需要
         pass 
         
-    if len(eval_ds) > 20:
-        print(f"⚠️ Truncating Eval Dataset from {len(eval_ds)} to 20 for speed...")
-        eval_ds = eval_ds.select(range(20))
+    if len(eval_ds) > 200:
+        print(f"⚠️ Truncating Eval Dataset from {len(eval_ds)} to 200 for speed...")
+        eval_ds = eval_ds.select(range(10))
     print(f"✅ Final Dataset Size - Train: {len(train_ds)}, Eval: {len(eval_ds)}")
 
     data_collator = SADataCollator(tokenizer=tokenizer)
@@ -640,7 +626,7 @@ def main():
         tokenizer=tokenizer
     )
     
-    print(f"🚀 Starting SA-Rank (Custom Loop)...")
+    print(f"🚀 Starting SA-Rank Stage 2 (Unlocked Geo Reward)...")
     trainer.train()
     trainer.save_model(cfg.output_dir)
 
