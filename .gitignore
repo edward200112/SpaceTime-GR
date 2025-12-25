@@ -25,7 +25,7 @@ HierGR/
 backup/
 data/processed_pinrec/*.npy
 data/processed_pinrec/
-
+SASRec_Data/
 # Virtual Environment
 venv/
 env/
@@ -49,6 +49,8 @@ data/rqvae_ckpt/*
 data/llm_ckpt/*
 !data/.gitkeep
 Rank-GRPO/SFT/sft_data/
+processed_data_old/
+runs/
 # Logs
 logs/
 *.log

@@ -198,7 +198,7 @@ def main():
     )
 
     print("🚀 Starting CoIN-SFT Training...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=True)
     
     print("Saving Final Model...")
     trainer.save_model(os.path.join(OUTPUT_DIR, "final_checkpoint"))

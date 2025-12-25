@@ -51,8 +51,8 @@ class SARankConfig(TrainingArguments):
     train_data_file: str = "./SFT/sft_data/sft_balanced_train.jsonl"
     meta_files: List[str] = None
     
-    # 学习参数
-    beta: float = 0.04 # KL Penalty
+    # 学习参数 [关键修改：提高 KL 惩罚，防止复读]
+    beta: float = 0.1 # 从 0.04 提高到 0.1
     
     # [新增] 必须配置项
     remove_unused_columns: bool = False 
@@ -238,6 +238,25 @@ class RewardSystem:
             p_obs = self.dm.get_propensity(pred_id)
             w = min(1.0/p_obs, self.cfg.ips_clip_m) ** self.cfg.ips_gamma
             
+            # ================= [关键修改] G. 复读机惩罚 =================
+            # 针对 "Current time" 和 "Next stop" 的死循环进行重罚
+            # 如果文本长度超过一定阈值，但独立词汇量很少，也视为复读
+            r_rep = 0.0
+            
+            # 1. 计算独立词比例 (针对 Sample 0 这种数字死循环)
+            words = reasoning_text.split()
+            unique_ratio = len(set(words)) / (len(words) + 1e-9)
+            
+            if (len(reasoning_text) > 100 and unique_ratio < 0.3) or \
+               reasoning_text.count("Current time") > 2 or \
+               reasoning_text.count("Next stop") > 2 or \
+               reasoning_text.count("Target:") > 2:  # <--- [新增] 专门针对 Target 重复出现
+                
+                r_rep = -2.0 # 只要触发任何一条，直接重罚
+            
+            r_consist += r_rep
+            # ========================================================
+
             rewards_rel.append(r_rel)
             rewards_geo.append(r_geo)
             rewards_pop.append(r_pop)
@@ -516,7 +535,7 @@ class SADataCollator:
 def main():
     # 1. 核心配置: Stage 2
     cfg = SARankConfig(
-        output_dir="./GRPO/output_sarank_stage2", # [修改] 避免覆盖 Stage 1
+        output_dir="./GRPO/output_sarank_stage3", # [修改] 避免覆盖 Stage 1
         remove_unused_columns=False,
         num_generations=4, 
         per_device_train_batch_size=1,
