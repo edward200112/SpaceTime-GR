@@ -46,42 +46,67 @@ class SASRec(torch.nn.Module):
             self.forward_layernorms.append(new_fwd_layernorm)
             new_fwd_layer = PointWiseFeedForward(args.embed_dim, args.dropout)
             self.forward_layers.append(new_fwd_layer)
+    @torch.no_grad()
+    def predict_candidates(self, input_ids: torch.LongTensor, candidate_ids: torch.LongTensor):
+        """
+        input_ids: [B, L]
+        candidate_ids: [B, C]
+        return: scores [B, C]
+        """
+        # 1) 得到 sequence hidden features: [B, L, H]
+        # 常见 SASRec 实现有 log2feats()；如果你不是这个名字，下面我给了 fallback 提示
+        feats = self.log2feats(input_ids)  # [B, L, H]
 
+        # 2) 取最后一个位置的表征（因为你是 left pad，最后位就是最新）
+        user_repr = feats[:, -1, :]  # [B, H]
+
+        # 3) 取候选 item embedding: [B, C, H]
+        # 常见实现是 item_emb 或 item_embedding
+        if hasattr(self, "item_emb"):
+            item_emb = self.item_emb(candidate_ids)
+        elif hasattr(self, "item_embedding"):
+            item_emb = self.item_embedding(candidate_ids)
+        else:
+            raise AttributeError("Cannot find item embedding layer: expected self.item_emb or self.item_embedding")
+
+        # 4) dot product -> [B, C]
+        scores = (user_repr.unsqueeze(1) * item_emb).sum(-1)
+        return scores
     def log2feats(self, log_seqs):
-        # [Fix] log_seqs is already a tensor on device
-        seqs = self.item_emb(log_seqs) 
+        # log_seqs is tensor on device
+        seqs = self.item_emb(log_seqs)
         seqs *= self.item_emb.embedding_dim ** 0.5
-        
-        # Positions 0, 1, 2, ...
-        positions = np.tile(np.array(range(log_seqs.shape[1])), [log_seqs.shape[0], 1])
-        seqs += self.pos_emb(torch.LongTensor(positions).to(self.dev))
+
+        # ✅ Fast torch positions on device (no numpy, no cpu->gpu copy)
+        B, L = log_seqs.size()
+        positions = torch.arange(L, device=log_seqs.device).unsqueeze(0).expand(B, L)
+        seqs = seqs + self.pos_emb(positions)
+
         seqs = self.emb_dropout(seqs)
 
         # Masking
-        timeline_mask = (log_seqs == 0) # BoolTensor
-        seqs *= ~timeline_mask.unsqueeze(-1) # broadcast
+        timeline_mask = (log_seqs == 0)  # BoolTensor
+        seqs = seqs * (~timeline_mask.unsqueeze(-1))  # broadcast
 
         tl = seqs.shape[1]
-        attention_mask = ~torch.tril(torch.ones((tl, tl), dtype=torch.bool, device=self.dev))
+        attention_mask = ~torch.tril(torch.ones((tl, tl), dtype=torch.bool, device=log_seqs.device))
 
         for i in range(len(self.attention_layers)):
             seqs = torch.transpose(seqs, 0, 1)
             Q = self.attention_layernorms[i](seqs)
-            
-            # [Fix] PyTorch MHA handles padding via key_padding_mask if needed, 
-            # but standard SASRec implementation relies on zero-masking logic above.
-            # Using attn_mask for causality is correct.
+
             mha_outputs, _ = self.attention_layers[i](Q, seqs, seqs, attn_mask=attention_mask)
-            
+
             seqs = Q + mha_outputs
             seqs = torch.transpose(seqs, 0, 1)
 
             seqs = self.forward_layernorms[i](seqs)
             seqs = self.forward_layers[i](seqs)
-            seqs *= ~timeline_mask.unsqueeze(-1)
+            seqs = seqs * (~timeline_mask.unsqueeze(-1))
 
-        log_feats = self.last_layernorm(seqs) 
+        log_feats = self.last_layernorm(seqs)
         return log_feats
+
 
     def forward(self, log_seqs, pos_seqs, neg_seqs):
         # Training Logic
