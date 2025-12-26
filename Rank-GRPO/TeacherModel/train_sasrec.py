@@ -26,7 +26,7 @@ python ./TeacherModel/train_sasrec.py \
   --num_epochs 50 \
   --num_negs 4 \
   --pop_alpha 0.75 \
-  --do_fast_eval --fast_eval_every 10 --fast_eval_users 2000 --fast_eval_neg 99 --fast_eval_batch_size 256 \
+  --do_fast_eval --fast_eval_every 5 --fast_eval_users 2000 --fast_eval_neg 99 --fast_eval_batch_size 256 \
   --do_strict_eval --strict_eval_every 10 --strict_eval_users 2000 --strict_eval_neg 99 --strict_eval_batch_size 128 \
   --early_stop --early_stop_metric NDCG@10 --early_stop_patience 5 --early_stop_min_delta 0.002 \
   --pin_memory --num_workers 14
