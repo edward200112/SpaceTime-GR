@@ -505,11 +505,110 @@ python HardMiningGRPO/train_grpo.py \
   --debug_log_every_steps 20 --debug_num_show 5 \
   --debug_dump_jsonl ./HardMiningGRPO/ckpt_grpo_candidates_best_v1/debug_samples.jsonl
 
-[OK] loaded SASRec: n_items=992862, max_len=50, dim=128, blocks=2, heads=2, dropout=0.2
-Traceback (most recent call last):
-  File "/workspace/Rank-GRPO/HardMiningGRPO/train_grpo.py", line 314, in <module>
-    main()
-  File "/workspace/Rank-GRPO/HardMiningGRPO/train_grpo.py", line 263, in main
-    r_cfg = ResolverConfig(
-            ^^^^^^^^^^^^^^^
-TypeError: ResolverConfig.__init__() got an unexpected keyword argument 'in_candidates_bonus'
+
+
+把 label space（所有 gmap_id）缩成了 每条样本一个候选集合 C，并且 reward 主要来自：
+是否输出了合法格式（Name (Cat)）
+是否命中候选集合
+是否等于 GT（在你现在的 match 定义里甚至是 casefold 容错匹配）
+这等价于让模型做一个 contextual multi-class choice：给定 prompt（含历史+候选列表），从 C 里选 1 个。
+
+现在的问题，将生成式的开放问题转换为分类问题后（50分类），100个step就收敛
+纯属是浪费参数
+
+
+最常见导致“秒满分”的数据/候选构造问题（优先排查）
+GT 在候选列表里位置固定（比如总在第 1 个/最后一个）
+→ 模型学会“永远选第一个”，match 也能 100%。
+prompt 泄漏了答案（比如候选列表格式里有标记，或者目标项在规则文本附近更显眼）
+训练样本重复/批处理重复
+你 step100 debug 里同一个例子重复出现很多次（Planet Fitness 连刷）也像是“batch 里大量重复样本/同一条 prompt 的多个 generation”。
+
+
+# 你现在这套更像“候选集 rerank”，想要它真的 work，建议这样改（按性价比排序）
+4.1 候选集构造：打破“秒满分”
+shuffle candidates（并保证 GT 位置随机）
+增大 K（比如 20→50→100），并确保负例真的是 hard negatives（SASRec topN、同地理邻域、同 category 等）
+让候选之间更难：同名不同店、同类不同区、相似地址等
+
+
+4.2 让 reward 变“连续可优化”，别一上来就满分
+现在 match_reward=1.0 是一个“硬饱和”信号。可以改成：
+把 match 降权 / 分阶段
+warmup：强调 in_candidates + format（先学会只从候选选）
+later：降低 match，抬高 teacher shaping（让模型在候选内部学排序）
+用 teacher 的 rank/prob 做主 reward（更连续）
+例：r = log(prob_sasrec(chosen)) 或 -rank(chosen) 之类
+或者：GT 只给一个小 bonus，不要 1.0 这种“一步到顶”的奖励
+
+
+
+## 也就是说，我现在将Ground truth 放进List中，让模型进行选择，相当于在练Rerank模型
+🌟在List中选择最佳内容，然后，我的neg sample都是用SASRec召回的内容，所以neg sample也足够hard，因此，这样是可行的方面
+🌟也就是这一次转换学到了Rerank的精髓，也就是从足够negative的sample中，能够找到Ground Truth，将rerank视为分类任务
+
+
+
+这是次要的，我们需要将分类问题转换为NTP问题
+
+是的，在“任务定义/决策空间”上你已经把它变成了候选集分类/排序；但在“训练优化”上你仍然是生成式 RL（policy gradient），不是 CE/NCE。
+这也是为什么你会看到：
+一旦模型能稳定输出正确候选 → reward 方差消失 → GRPO 梯度消失（grad_norm=0）
+训练很快“看起来完美”，但不一定真的学到了“排序结构”，更可能是学到了你候选构造里的捷径
+
+不是召回（recall）：召回是从全库（百万/千万 item）里“捞一小撮候选”，通常靠向量检索/双塔/ANN。
+也不是全库 rank：全库 rank 至少在训练目标上要“能对任意 item 打分”，推理时也能大规模打分或近似打分。
+你现在是：候选集 
+
+已给定 → 让模型从 C 里选 1 个 → 这是典型 rerank/choice。
+
+我终于知道为什么快手OneRec为什么在他的全流程生成式推荐中，不加入Rerank了，因为Rerank的训练就是一个分类任务
+对于分类任务，让大模型来做，就有点浪费算力了。
+但是如果是一个从头到尾的模型的话，应该就没问题
+
+但是前面几个步骤的任务和rerank可能不是一个
+ranking是排序
+
+新的训练代码如下（转换为rerank任务）：
+python HardMiningGRPO/train_grpo.py \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
+  --train_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.cand.fixed_precise_v2.jsonl \
+  --eval_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_val.cand.fixed_precise_v2.jsonl \
+  --sasrec_pkl /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec_Data/sasrec_full_latest.pt \
+  --output_dir ./HardMiningGRPO/ckpt_grpo_candidates_rerank_v3 \
+  --per_device_bs 16 --grad_accum 2 \
+  --lr 5e-6 --num_generations 8 \
+  --max_length 1280 --max_new_tokens 32 \
+  --temperature 0.9 \
+  --shuffle_candidates \
+  --format_bonus 0.05 --in_candidates_bonus 0.10 \
+  --match_reward_exact 0.25 --match_reward_fold 0.03 \
+  --alpha 0.6 --softmax_temp 1.0 --teacher_mode zscore --teacher_clip 5.0 \
+  --copy_penalty 0.08 --duplicate_penalty 0.02 \
+  --extra_text_penalty 0.05 --unknown_penalty 0.10 --prefix_penalty 0.05 --incomplete_penalty 0.10 \
+  --use_chat_template \
+  --debug_log_every_steps 20 --debug_num_show 5 \
+  --debug_dump_jsonl ./HardMiningGRPO/ckpt_grpo_candidates_rerank_v3/debug_samples.jsonl \
+  --print_target_pos_hist
+
+
+
+你现在：
+in_candidates_rate: 0.031 → 0.250(step80) → 0.344(step100) ✅（涨得很快）
+entropy: 1.53（不塌缩，而且在探索）✅
+grad_norm: 3.38（有有效梯度）✅
+reward_std: 0.26（组内有差异，GRPO 能做相对优化）✅
+group_unique_rate≈0.875（开始有些重复，但还远不到塌缩；而且你有 duplicate penalty 在控）✅
+
+
+你现在：
+in_candidates_rate: 0.031 → 0.250(step80) → 0.344(step100) ✅（涨得很快）
+entropy: 1.53（不塌缩，而且在探索）✅
+grad_norm: 3.38（有有效梯度）✅
+reward_std: 0.26（组内有差异，GRPO 能做相对优化）✅
+group_unique_rate≈0.875（开始有些重复，但还远不到塌缩；而且你有 duplicate penalty 在控）✅
+
+
+

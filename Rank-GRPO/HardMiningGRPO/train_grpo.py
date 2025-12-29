@@ -3,7 +3,8 @@ import os
 import sys
 import argparse
 import random
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
+from collections import Counter
 
 import torch
 from datasets import load_dataset
@@ -17,13 +18,19 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from TeacherModel.SASRec import SASRec
-from HardMiningGRPO.reward_sasrec import SasrecScorer, ResolverConfig, make_reward_fn
+from HardMiningGRPO.reward_sasrec import SasrecScorer, ResolverConfig, make_reward_fn, parse_namecat_keys
 
-# fallback template（当 tokenizer 没有 chat_template 时）
 USER_PREFIX_TEMPLATE = "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+RULE_FALLBACK = "只输出一个地点名(类别)，不要解释"
 
-# 如果你的 prompt 里已经包含候选+规则，这里不强加，只做兜底
-RULE_FALLBACK = "只能从下面候选列表中选择一个，并且原样只输出一个地点名(类别)，不要解释。"
+CAND_HEADER_CANON = "候选地点（只能从下列候选中选 1 个，并原样输出；不要输出其他文字）："
+CAND_HEADERS = [
+    CAND_HEADER_CANON,
+    "候选地点（只能从下列候选中选 1 个，并原样输出；不要输出其他文字）:",
+    "候选地点（只能从下列候选中选 1 个，并原样输出；不要输出其他文字）",
+    "候选地点：",
+    "候选地点:",
+]
 
 
 def parse_args():
@@ -40,7 +47,7 @@ def parse_args():
 
     # GRPO
     ap.add_argument("--max_length", type=int, default=1280)
-    ap.add_argument("--max_new_tokens", type=int, default=32)  # ✅ 默认拉大，避免截断导致 unknown 飙升
+    ap.add_argument("--max_new_tokens", type=int, default=32)
     ap.add_argument("--per_device_bs", type=int, default=16)
     ap.add_argument("--grad_accum", type=int, default=2)
     ap.add_argument("--lr", type=float, default=5e-6)
@@ -49,20 +56,36 @@ def parse_args():
     ap.add_argument("--num_train_epochs", type=int, default=1)
 
     ap.add_argument("--num_generations", type=int, default=8)
-    ap.add_argument("--temperature", type=float, default=0.7)  # ✅ 默认稍低一点更稳
+    ap.add_argument("--temperature", type=float, default=0.9)
+
+    # ✅ 强制打破“第一个就是 GT”的捷径
+    ap.add_argument(
+        "--shuffle_candidates",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Deterministically shuffle candidates per sample AND rewrite prompt candidate list accordingly.",
+    )
+    ap.add_argument("--print_target_pos_hist", action="store_true")
 
     # reward cfg
     ap.add_argument("--format_bonus", type=float, default=0.05)
-    ap.add_argument("--in_candidates_bonus", type=float, default=0.10)  # ✅ 关键：先学会只从候选里选
-    ap.add_argument("--match_reward", type=float, default=1.0)
+    ap.add_argument("--in_candidates_bonus", type=float, default=0.10)
 
-    ap.add_argument("--alpha", type=float, default=0.3)
+    ap.add_argument("--match_reward_exact", type=float, default=0.25)
+    ap.add_argument("--match_reward_fold", type=float, default=0.03)
+
+    ap.add_argument("--alpha", type=float, default=0.6)
     ap.add_argument("--softmax_temp", type=float, default=1.0)
+    ap.add_argument("--teacher_mode", type=str, default="zscore",
+                    choices=["zscore", "logprob", "prob", "rank"])
+    ap.add_argument("--teacher_clip", type=float, default=5.0)
 
     ap.add_argument("--extra_text_penalty", type=float, default=0.05)
     ap.add_argument("--unknown_penalty", type=float, default=0.10)
     ap.add_argument("--prefix_penalty", type=float, default=0.05)
-    ap.add_argument("--incomplete_penalty", type=float, default=0.10)  # ✅ 括号没闭合/截断的罚
+    ap.add_argument("--incomplete_penalty", type=float, default=0.10)
+    ap.add_argument("--copy_penalty", type=float, default=0.08)
+    ap.add_argument("--duplicate_penalty", type=float, default=0.02)
 
     # sasrec arch
     ap.add_argument("--sasrec_embed_dim", type=int, default=128)
@@ -99,6 +122,70 @@ def build_chat_prompt(tok, user_text: str) -> str:
     return USER_PREFIX_TEMPLATE.format(prompt=user_text)
 
 
+def _get_field(ex: Dict[str, Any], keys, required=True, default=None):
+    for k in keys:
+        if k in ex:
+            return ex[k]
+    if required:
+        raise KeyError(f"missing required field, tried: {keys}")
+    return default
+
+
+def _det_shuffle_pairs(pairs: List[Tuple[Any, Any]], seed: int):
+    rng = random.Random(seed)
+    rng.shuffle(pairs)
+
+
+def _find_target_pos(target_namecat: str, candidate_namecats: List[str]) -> int:
+    tgt_exact, tgt_fold, ok = parse_namecat_keys(target_namecat)
+    if not ok:
+        tgt_fold = str(target_namecat).strip().casefold()
+
+    for i, s in enumerate(candidate_namecats):
+        k_exact, k_fold, ok2 = parse_namecat_keys(s)
+        if ok2:
+            if k_fold == tgt_fold:
+                return i
+        else:
+            if str(s).strip().casefold() == tgt_fold:
+                return i
+    return -1
+
+
+def _build_candidate_block(cands: List[str]) -> str:
+    lines = [CAND_HEADER_CANON]
+    for i, c in enumerate(cands, 1):
+        lines.append(f"{i}. {c}")
+    return "\n".join(lines)
+
+
+def _rewrite_prompt_candidates(raw_prompt: str, cand_namecats: List[str]) -> str:
+    """
+    ✅ 关键：prompt 里本来就包含候选列表，并且你数据里 GT 总是第一个
+    所以必须把 prompt 的候选段落也替换成 shuffle 后的顺序，才能消除捷径。
+    """
+    p = (raw_prompt or "").rstrip()
+    new_block = _build_candidate_block(cand_namecats)
+
+    # 找到任意一个候选 header，截断并替换其后的候选列表
+    hit_pos = -1
+    hit_hdr = None
+    for hdr in CAND_HEADERS:
+        pos = p.find(hdr)
+        if pos != -1:
+            hit_pos = pos
+            hit_hdr = hdr
+            break
+
+    if hit_pos != -1:
+        prefix = p[:hit_pos].rstrip()
+        # 保留 prefix，然后用 canonical block 覆盖
+        return (prefix + "\n" + new_block).rstrip()
+
+    # 如果原 prompt 没有候选段，就直接追加
+    return (p + "\n" + new_block).rstrip()
+
+
 def load_sasrec_from_ckpt(
     sasrec_pkl: str,
     sasrec_ckpt: str,
@@ -132,7 +219,6 @@ def load_sasrec_from_ckpt(
     else:
         state_dict = ckpt_obj
 
-    # sanity check
     if "item_emb.weight" in state_dict:
         ckpt_dim = int(state_dict["item_emb.weight"].shape[1])
         if ckpt_dim != int(embed_dim):
@@ -164,21 +250,11 @@ def load_sasrec_from_ckpt(
     return sasrec
 
 
-def _get_field(ex: Dict[str, Any], keys, required=True, default=None):
-    for k in keys:
-        if k in ex:
-            return ex[k]
-    if required:
-        raise KeyError(f"missing required field, tried: {keys}")
-    return default
-
-
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     seed_everything(args.seed)
 
-    # TRL constraint
     generation_batch_size = int(args.per_device_bs) * int(args.grad_accum)
     if generation_batch_size % int(args.num_generations) != 0:
         raise ValueError(
@@ -190,7 +266,7 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
-    tok.truncation_side = "left"  # ✅ 候选在尾部，必须保尾部
+    tok.truncation_side = "left"  # 候选在尾部，必须保尾部
 
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
     model = AutoModelForCausalLM.from_pretrained(
@@ -203,7 +279,6 @@ def main():
     model = PeftModel.from_pretrained(model, args.adapter, is_trainable=True)
     model.print_trainable_parameters()
 
-    # stop tokens
     eos_ids = []
     if tok.eos_token_id is not None:
         eos_ids.append(int(tok.eos_token_id))
@@ -222,30 +297,61 @@ def main():
     train_ds = load_dataset("json", data_files=args.train_jsonl, split="train")
     eval_ds = load_dataset("json", data_files=args.eval_jsonl, split="train")
 
-    def format_ex(ex: Dict[str, Any]) -> Dict[str, Any]:
+    def format_ex(ex: Dict[str, Any], idx: int) -> Dict[str, Any]:
         raw = _get_field(ex, ["prompt"])
-        # 兜底：如果有人生成数据漏了规则
+        raw = (raw or "").rstrip()
+
+        # 兜底：确保规则存在
         if "只输出一个地点名" not in raw:
-            raw = raw.rstrip() + "\n" + RULE_FALLBACK
+            raw = (raw + "\n" + RULE_FALLBACK).rstrip()
 
         cand_nc = _get_field(ex, ["candidate_namecats", "candidates_namecat", "candidates_namecats"])
         cand_it = _get_field(ex, ["candidate_item_ids", "candidates_item_ids", "candidates_ids"])
+        if not isinstance(cand_nc, list) or not isinstance(cand_it, list) or len(cand_nc) != len(cand_it) or len(cand_nc) == 0:
+            raise ValueError(f"[BAD DATA] candidate lists invalid: len(namecats)={len(cand_nc)} len(item_ids)={len(cand_it)}")
+
+        pairs = list(zip(cand_nc, cand_it))
+        if args.shuffle_candidates:
+            _det_shuffle_pairs(pairs, seed=args.seed + int(idx))
+
+        cand_nc2, cand_it2 = zip(*pairs)
+        cand_nc2 = list(cand_nc2)
+        cand_it2 = [int(x) for x in cand_it2]
+
+        tgt_nc = _get_field(ex, ["target_namecat"])
+        tgt_pos = _find_target_pos(tgt_nc, cand_nc2)
+        if tgt_pos < 0:
+            raise ValueError("[BAD DATA] target_namecat not found in candidate_namecats. Ensure GT is included in candidates.")
+
+        # ✅ 关键：重写 prompt 里的候选列表，顺序与 cand_nc2 一致（否则捷径还在）
+        raw2 = _rewrite_prompt_candidates(raw, cand_nc2)
 
         out = {
-            "prompt": build_chat_prompt(tok, raw) if args.use_chat_template else raw,
-            "prompt_raw": raw,
+            "prompt": build_chat_prompt(tok, raw2) if args.use_chat_template else raw2,
+            "prompt_raw": raw2,
             "history_item_ids": _get_field(ex, ["history_item_ids"]),
-            "target_item_id": _get_field(ex, ["target_item_id"]),
-            "target_namecat": _get_field(ex, ["target_namecat"]),
-            "candidate_namecats": cand_nc,
-            "candidate_item_ids": cand_it,
+            "target_item_id": int(_get_field(ex, ["target_item_id"])),
+            "target_namecat": tgt_nc,
+            "candidate_namecats": cand_nc2,
+            "candidate_item_ids": cand_it2,
+            "target_pos": int(tgt_pos),
         }
         return out
 
-    # map 用 num_proc 加速（不影响 determinism）
     num_proc = max(1, (os.cpu_count() or 8) // 2)
-    train_ds = train_ds.map(format_ex, remove_columns=train_ds.column_names, num_proc=num_proc)
-    eval_ds = eval_ds.map(format_ex, remove_columns=eval_ds.column_names, num_proc=num_proc)
+    train_ds = train_ds.map(format_ex, with_indices=True, remove_columns=train_ds.column_names, num_proc=num_proc)
+    eval_ds = eval_ds.map(format_ex, with_indices=True, remove_columns=eval_ds.column_names, num_proc=num_proc)
+
+    if args.print_target_pos_hist:
+        def _hist(ds, name: str):
+            cnt = Counter(ds["target_pos"])
+            total = sum(cnt.values())
+            top10 = sorted(cnt.items(), key=lambda x: x[1], reverse=True)[:10]
+            print(f"\n[TARGET_POS_HIST] {name} total={total} top10(pos,count,ratio):")
+            for pos, c in top10:
+                print(f"  pos={pos:>3d}  count={c:>8d}  ratio={c/total:.4f}")
+        _hist(train_ds, "train")
+        _hist(eval_ds, "eval")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     sasrec = load_sasrec_from_ckpt(
@@ -263,13 +369,22 @@ def main():
     r_cfg = ResolverConfig(
         format_bonus=float(args.format_bonus),
         in_candidates_bonus=float(args.in_candidates_bonus),
-        match_reward=float(args.match_reward),
+
+        match_reward_exact=float(args.match_reward_exact),
+        match_reward_fold=float(args.match_reward_fold),
+
         alpha=float(args.alpha),
         softmax_temp=float(args.softmax_temp),
+        teacher_mode=str(args.teacher_mode),
+        teacher_clip=float(args.teacher_clip),
+
         extra_text_penalty=float(args.extra_text_penalty),
         unknown_penalty=float(args.unknown_penalty),
         prefix_penalty=float(args.prefix_penalty),
         incomplete_penalty=float(args.incomplete_penalty),
+        copy_penalty=float(args.copy_penalty),
+        duplicate_penalty=float(args.duplicate_penalty),
+
         debug_log_every_steps=int(args.debug_log_every_steps),
         debug_num_show=int(args.debug_num_show),
         debug_dump_jsonl=str(args.debug_dump_jsonl),
