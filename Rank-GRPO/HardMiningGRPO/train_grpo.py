@@ -9,7 +9,7 @@ from collections import Counter
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainerCallback
 from peft import PeftModel
 
 from trl import GRPOTrainer, GRPOConfig
@@ -59,7 +59,7 @@ def parse_args():
     ap.add_argument("--num_generations", type=int, default=8)
     ap.add_argument("--temperature", type=float, default=0.9)
 
-    # eval HR
+    # ✅ HR eval (callback)
     ap.add_argument("--eval_steps", type=int, default=100)
     ap.add_argument("--eval_max_samples", type=int, default=2000, help="<=0 means use full eval set.")
     ap.add_argument("--eval_prompt_bs", type=int, default=4, help="how many prompts per eval batch.")
@@ -70,17 +70,20 @@ def parse_args():
     ap.add_argument("--shuffle_candidates", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--print_target_pos_hist", action="store_true")
 
-    # reward (HR-aligned version should be in reward_sasrec.py)
+    # ✅ reward cfg（匹配你当前 reward_sasrec.py 的 ResolverConfig）
     ap.add_argument("--format_bonus", type=float, default=0.05)
-    ap.add_argument("--in_candidates_bonus", type=float, default=0.05)
+    ap.add_argument("--in_candidates_bonus", type=float, default=0.10)
 
-    ap.add_argument("--correct_reward", type=float, default=2.0)
-    ap.add_argument("--wrong_penalty", type=float, default=0.3)
-    ap.add_argument("--unknown_penalty", type=float, default=0.6)
-    ap.add_argument("--rank_shaping_weight", type=float, default=0.2)
+    ap.add_argument("--match_reward_exact", type=float, default=0.25)
+    ap.add_argument("--match_reward_fold", type=float, default=0.03)
+
+    ap.add_argument("--alpha", type=float, default=0.6)
     ap.add_argument("--softmax_temp", type=float, default=1.0)
+    ap.add_argument("--teacher_mode", type=str, default="zscore", choices=["zscore", "logprob", "prob", "rank"])
+    ap.add_argument("--teacher_clip", type=float, default=5.0)
 
     ap.add_argument("--extra_text_penalty", type=float, default=0.05)
+    ap.add_argument("--unknown_penalty", type=float, default=0.10)
     ap.add_argument("--prefix_penalty", type=float, default=0.05)
     ap.add_argument("--incomplete_penalty", type=float, default=0.10)
     ap.add_argument("--copy_penalty", type=float, default=0.08)
@@ -136,12 +139,12 @@ def _det_shuffle_pairs(pairs: List[Tuple[Any, Any]], seed: int):
 
 
 def _find_target_pos(target_namecat: str, candidate_namecats: List[str]) -> int:
-    tgt_exact, tgt_fold, ok = parse_namecat_keys(target_namecat)
+    _, tgt_fold, ok = parse_namecat_keys(target_namecat)
     if not ok:
         tgt_fold = str(target_namecat).strip().casefold()
 
     for i, s in enumerate(candidate_namecats):
-        k_exact, k_fold, ok2 = parse_namecat_keys(s)
+        _, k_fold, ok2 = parse_namecat_keys(s)
         if ok2:
             if k_fold == tgt_fold:
                 return i
@@ -209,15 +212,6 @@ def load_sasrec_from_ckpt(
     else:
         state_dict = ckpt_obj
 
-    if "item_emb.weight" in state_dict:
-        ckpt_dim = int(state_dict["item_emb.weight"].shape[1])
-        if ckpt_dim != int(embed_dim):
-            raise ValueError(f"SASRec embed_dim mismatch: ckpt_dim={ckpt_dim} vs args.embed_dim={embed_dim}")
-    if "pos_emb.weight" in state_dict:
-        ckpt_len = int(state_dict["pos_emb.weight"].shape[0])
-        if ckpt_len != int(max_len):
-            raise ValueError(f"SASRec max_len mismatch: ckpt_max_len={ckpt_len} vs args.max_len={max_len}")
-
     class _Args:
         pass
 
@@ -252,18 +246,13 @@ def _score_sequences_avg_logprob(
     labels: torch.Tensor,
     length_norm: bool = True,
 ) -> torch.Tensor:
-    """
-    Return score per sequence: average logprob over labeled tokens (higher is better).
-    labels: same shape as input_ids, with -100 for ignore, token ids for scored positions.
-    """
     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
     logits = outputs.logits  # [B, L, V]
-    # shift
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = labels[:, 1:].contiguous()  # predict token t from logits t-1
-    B, Lm1 = shift_labels.shape
 
-    # CE per token (ignore -100)
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+
+    B, Lm1 = shift_labels.shape
     loss = F.cross_entropy(
         shift_logits.view(-1, shift_logits.size(-1)),
         shift_labels.view(-1),
@@ -273,14 +262,14 @@ def _score_sequences_avg_logprob(
 
     mask = (shift_labels != -100).float()
     tok_cnt = mask.sum(dim=1).clamp_min(1.0)
-    nll = (loss * mask).sum(dim=1)  # negative log likelihood
+    nll = (loss * mask).sum(dim=1)
+
     if length_norm:
         return -(nll / tok_cnt)
     return -nll
 
 
 def _encode_prompt_and_candidate(tok, prompt: str, cand: str):
-    # add_special_tokens=False because prompt already contains chat markers if any
     p_ids = tok.encode(prompt, add_special_tokens=False)
     c_ids = tok.encode(cand, add_special_tokens=False)
     return p_ids, c_ids
@@ -297,14 +286,10 @@ def score_candidates_for_prompts(
     device: str,
     length_norm: bool = True,
 ) -> torch.Tensor:
-    """
-    Return scores tensor [B, K] where K = len(candidates[b]).
-    """
     B = len(prompts)
     K = len(candidates[0])
     assert all(len(x) == K for x in candidates), "Eval expects fixed K per sample."
 
-    # build flattened sequences
     flat_input_ids = []
     flat_labels = []
     flat_attn = []
@@ -315,19 +300,16 @@ def score_candidates_for_prompts(
             cand = candidates[b][k]
             p_ids, c_ids = _encode_prompt_and_candidate(tok, prompt, cand)
 
-            # concat
             ids = p_ids + c_ids
-            # truncate from left to keep tail (important for candidates near end)
-            if len(ids) > max_total_len:
-                ids = ids[-max_total_len:]
-                # if truncated, prompt_len shrinks; but we must score only candidate tokens.
-                # We approximate: ensure we always keep full candidate tokens by
-                # forcing last len(c_ids) tokens to be candidate tokens if possible.
-                if len(c_ids) <= max_total_len:
-                    ids = ids[:-len(c_ids)] + c_ids
 
-            # recompute prompt_len inside truncated sequence
-            # assume candidate tokens are the last len(c_ids) tokens (enforced above)
+            # truncate from left; keep candidate tail
+            if len(ids) > max_total_len:
+                if len(c_ids) <= max_total_len:
+                    ids = ids[-max_total_len:]
+                    ids = ids[:-len(c_ids)] + c_ids
+                else:
+                    ids = c_ids[-max_total_len:]
+
             cand_len = min(len(c_ids), len(ids))
             prompt_len = len(ids) - cand_len
 
@@ -338,7 +320,7 @@ def score_candidates_for_prompts(
             flat_input_ids.append(ids)
             flat_labels.append(labels)
 
-    # pad right
+    # ✅ 左 padding（与你 tok.padding_side="left" 对齐）
     pad_id = int(tok.pad_token_id)
     max_len = max(len(x) for x in flat_input_ids)
     for i in range(len(flat_input_ids)):
@@ -347,9 +329,9 @@ def score_candidates_for_prompts(
         attn = [1] * len(ids)
         if len(ids) < max_len:
             pad_n = max_len - len(ids)
-            ids = ids + [pad_id] * pad_n
-            lab = lab + [-100] * pad_n
-            attn = attn + [0] * pad_n
+            ids = [pad_id] * pad_n + ids
+            lab = [-100] * pad_n + lab
+            attn = [0] * pad_n + attn
         flat_input_ids[i] = ids
         flat_labels[i] = lab
         flat_attn.append(attn)
@@ -358,7 +340,6 @@ def score_candidates_for_prompts(
     labels = torch.tensor(flat_labels, dtype=torch.long, device=device)
     attn = torch.tensor(flat_attn, dtype=torch.long, device=device)
 
-    # score in chunks
     scores = []
     N = input_ids.size(0)
     for s in range(0, N, score_bs):
@@ -371,6 +352,7 @@ def score_candidates_for_prompts(
             length_norm=length_norm,
         )
         scores.append(sc.detach().float().cpu())
+
     scores = torch.cat(scores, dim=0)  # [B*K]
     return scores.view(B, K)
 
@@ -395,10 +377,9 @@ def compute_hr_at_k(
     hr10_hit = 0
     total = 0
 
-    model_was_train = model.training
+    was_train = model.training
     model.eval()
 
-    # eval in batches of prompts
     for st in range(0, n, prompt_bs):
         ed = min(n, st + prompt_bs)
         batch = eval_ds.select(range(st, ed))
@@ -407,7 +388,6 @@ def compute_hr_at_k(
         candidates = list(batch["candidate_namecats"])
         tgt_pos = torch.tensor(batch["target_pos"], dtype=torch.long)
 
-        # score [B,K]
         sc = score_candidates_for_prompts(
             model=model,
             tok=tok,
@@ -419,14 +399,14 @@ def compute_hr_at_k(
             length_norm=length_norm,
         )
 
-        top10 = torch.topk(sc, k=min(10, sc.size(1)), dim=1).indices  # [B,10]
+        top10 = torch.topk(sc, k=min(10, sc.size(1)), dim=1).indices
         top1 = top10[:, 0]
 
         hr1_hit += int((top1 == tgt_pos).sum().item())
         hr10_hit += int((top10 == tgt_pos.unsqueeze(1)).any(dim=1).sum().item())
         total += (ed - st)
 
-    if model_was_train:
+    if was_train:
         model.train()
 
     return {
@@ -437,9 +417,6 @@ def compute_hr_at_k(
 
 
 class GRPOTrainerWithHREval(GRPOTrainer):
-    """
-    Let Trainer's built-in evaluation loop call this every eval_steps.
-    """
     def __init__(self, *args, tokenizer=None, eval_max_samples=0, eval_prompt_bs=4, eval_score_bs=64,
                  eval_length_norm=True, max_total_len=1408, **kwargs):
         super().__init__(*args, **kwargs)
@@ -467,9 +444,37 @@ class GRPOTrainerWithHREval(GRPOTrainer):
             device=str(device),
             length_norm=self._eval_length_norm,
         )
-        # Trainer will log/print returned metrics
-        self.log(metrics)
+        # ✅ 显式打印 + log，保证你一定能看到
+        print(f"[EVAL @ step={self.state.global_step}] {metrics}", flush=True)
+        try:
+            self.log(metrics)
+        except Exception:
+            pass
         return metrics
+
+
+import torch.distributed as dist
+from transformers import TrainerCallback
+
+class EvalEveryNStepsCallback(TrainerCallback):
+    """每 N 个 global_step 手动触发 trainer.evaluate()（不依赖 GRPOConfig 支持 eval 参数）"""
+    def __init__(self, trainer, every_n_steps: int):
+        self.trainer = trainer
+        self.every = int(every_n_steps)
+        self._last = -1
+
+    def on_step_end(self, args, state, control, **kwargs):
+        # 多卡时只让 rank0 eval（单卡也兼容）
+        if dist.is_available() and dist.is_initialized():
+            if dist.get_rank() != 0:
+                return control
+
+        gs = int(getattr(state, "global_step", 0))
+        if self.every > 0 and gs > 0 and (gs % self.every == 0) and (gs != self._last):
+            self._last = gs
+            _ = self.trainer.evaluate()  # evaluate() 里我们会 print eval_hr1/10
+        return control
+
 
 
 def main():
@@ -477,7 +482,6 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     seed_everything(args.seed)
 
-    # TRL constraint: per_device_bs*grad_accum must be divisible by num_generations
     generation_batch_size = int(args.per_device_bs) * int(args.grad_accum)
     if generation_batch_size % int(args.num_generations) != 0:
         raise ValueError(
@@ -502,7 +506,6 @@ def main():
     model = PeftModel.from_pretrained(model, args.adapter, is_trainable=True)
     model.print_trainable_parameters()
 
-    # stop tokens
     eos_ids = []
     if tok.eos_token_id is not None:
         eos_ids.append(int(tok.eos_token_id))
@@ -524,7 +527,6 @@ def main():
     def format_ex(ex: Dict[str, Any], idx: int) -> Dict[str, Any]:
         raw = _get_field(ex, ["prompt"])
         raw = (raw or "").rstrip()
-
         if "只输出一个地点名" not in raw:
             raw = (raw + "\n" + RULE_FALLBACK).rstrip()
 
@@ -548,7 +550,7 @@ def main():
 
         raw2 = _rewrite_prompt_candidates(raw, cand_nc2)
 
-        out = {
+        return {
             "prompt": build_chat_prompt(tok, raw2) if args.use_chat_template else raw2,
             "prompt_raw": raw2,
             "history_item_ids": _get_field(ex, ["history_item_ids"]),
@@ -556,9 +558,8 @@ def main():
             "target_namecat": tgt_nc,
             "candidate_namecats": cand_nc2,
             "candidate_item_ids": cand_it2,
-            "target_pos": int(tgt_pos),
+            "target_pos": int(tgt_pos),  # ✅ eval HR 用
         }
-        return out
 
     num_proc = max(1, (os.cpu_count() or 8) // 2)
     train_ds = train_ds.map(format_ex, with_indices=True, remove_columns=train_ds.column_names, num_proc=num_proc)
@@ -592,14 +593,16 @@ def main():
         format_bonus=float(args.format_bonus),
         in_candidates_bonus=float(args.in_candidates_bonus),
 
-        correct_reward=float(args.correct_reward),
-        wrong_penalty=float(args.wrong_penalty),
-        unknown_penalty=float(args.unknown_penalty),
-        rank_shaping_weight=float(args.rank_shaping_weight),
+        match_reward_exact=float(args.match_reward_exact),
+        match_reward_fold=float(args.match_reward_fold),
 
+        alpha=float(args.alpha),
         softmax_temp=float(args.softmax_temp),
+        teacher_mode=str(args.teacher_mode),
+        teacher_clip=float(args.teacher_clip),
 
         extra_text_penalty=float(args.extra_text_penalty),
+        unknown_penalty=float(args.unknown_penalty),
         prefix_penalty=float(args.prefix_penalty),
         incomplete_penalty=float(args.incomplete_penalty),
         copy_penalty=float(args.copy_penalty),
@@ -612,7 +615,7 @@ def main():
     )
     reward_fn = make_reward_fn(scorer, r_cfg)
 
-    # GRPO config
+    # ✅ 注意：这里不再传 evaluation_strategy/eval_steps
     grpo_cfg = GRPOConfig(
         output_dir=args.output_dir,
         learning_rate=float(args.lr),
@@ -629,14 +632,8 @@ def main():
         max_completion_length=int(args.max_new_tokens),
         num_generations=int(args.num_generations),
         temperature=float(args.temperature),
-
-        # ✅ 每 100 step 自动触发 evaluate()
-        evaluation_strategy="steps",
-        eval_steps=int(args.eval_steps),
     )
 
-    # total len for scoring prompt+candidate
-    # (prompt max_length + completion max_new_tokens) is usually safe
     max_total_len = int(args.max_length) + int(args.max_new_tokens)
 
     trainer = GRPOTrainerWithHREval(
@@ -654,6 +651,10 @@ def main():
         eval_length_norm=args.eval_length_norm,
         max_total_len=max_total_len,
     )
+
+    # ✅ 关键：显式注册 callback（不依赖 config）
+    trainer.add_callback(EvalEveryNStepsCallback(trainer, args.eval_steps))
+
 
     trainer.train()
     trainer.save_model(args.output_dir)

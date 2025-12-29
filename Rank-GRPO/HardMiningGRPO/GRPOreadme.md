@@ -591,7 +591,12 @@ python HardMiningGRPO/train_grpo.py \
   --use_chat_template \
   --debug_log_every_steps 20 --debug_num_show 5 \
   --debug_dump_jsonl ./HardMiningGRPO/ckpt_grpo_candidates_rerank_v3/debug_samples.jsonl \
-  --print_target_pos_hist
+  --print_target_pos_hist\
+  --eval_steps 10 \
+  --eval_max_samples 200 \
+  --eval_prompt_bs 1 \
+  --eval_score_bs 8 \
+  --eval_length_norm
 
 
 
