@@ -1,35 +1,114 @@
+# HardMiningSFT/train_stage2_coin_rankmargin.py
 import os
+import json
 import argparse
-from typing import Optional
+from typing import Optional, List, Dict, Any, Tuple
 
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, DataCollatorWithPadding
-from peft import LoraConfig, get_peft_model, PeftModel
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    DataCollatorWithPadding,
+)
+from peft import PeftModel
 
 from custom_trainer_rankmargin import CoINSFTTrainerRankMargin
-
 
 USER_PREFIX_TEMPLATE = "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 SUFFIX = "<|im_end|>"
 
 
-def format_chat(prompt: str, completion: str) -> str:
-    return USER_PREFIX_TEMPLATE.format(prompt=prompt) + completion + SUFFIX
+# -------------------------
+# Utils
+# -------------------------
+def find_latest_checkpoint(output_dir: str) -> Optional[str]:
+    if not os.path.exists(output_dir):
+        return None
+    ckpts = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
+    if not ckpts:
+        return None
+    ckpts.sort(key=lambda x: int(x.split("-")[-1]))
+    last = ckpts[-1]
+    p = os.path.join(output_dir, last)
+    if os.path.isdir(p) and len(os.listdir(p)) > 0:
+        return p
+    return None
 
 
+def ensure_dummy_safetensors_index(ckpt_dir: str):
+    """
+    LoRA-only checkpoint 有时没有 *safetensors.index.json，
+    Trainer resume 会尝试找 index 文件导致报错。补一个空索引即可。
+    """
+    idx1 = os.path.join(ckpt_dir, "pytorch_model.bin.index.json")
+    idx2 = os.path.join(ckpt_dir, "model.safetensors.index.json")
+    if os.path.exists(idx1) or os.path.exists(idx2):
+        return
+    dummy = {"metadata": {"total_size": 0}, "weight_map": {}}
+    with open(idx2, "w", encoding="utf-8") as f:
+        json.dump(dummy, f)
+    print(f"🩹 Patched dummy index for Trainer resume: {idx2}")
+
+
+def load_batch_config_from_checkpoint(ckpt_dir: str) -> Optional[Tuple[int, int]]:
+    """
+    读取 checkpoint 里保存的 TrainingArguments / SFTConfig，拿到：
+    - per_device_train_batch_size
+    - gradient_accumulation_steps
+
+    PyTorch 2.6+ 默认 weights_only=True，会导致读取 training_args.bin 失败；
+    如果 ckpt 是你自己训练出来的（可信），这里显式 weights_only=False。
+    """
+    ta_bin = os.path.join(ckpt_dir, "training_args.bin")
+    if not os.path.exists(ta_bin):
+        return None
+
+    # 1) PyTorch 2.6+：显式 weights_only=False（你自己 ckpt 安全）
+    try:
+        ta = torch.load(ta_bin, map_location="cpu", weights_only=False)
+        bs = int(getattr(ta, "per_device_train_batch_size"))
+        ga = int(getattr(ta, "gradient_accumulation_steps"))
+        return bs, ga
+    except TypeError:
+        # 老 torch 没有 weights_only 参数
+        pass
+    except Exception as e:
+        print(f"[WARN] torch.load(training_args.bin, weights_only=False) failed: {e}")
+
+    # 2) fallback：老版本 / 兼容尝试（不保证能读）
+    try:
+        ta = torch.load(ta_bin, map_location="cpu")
+        bs = int(getattr(ta, "per_device_train_batch_size"))
+        ga = int(getattr(ta, "gradient_accumulation_steps"))
+        return bs, ga
+    except Exception as e:
+        print(f"[WARN] Failed to read training_args.bin for batch config: {e}")
+        return None
+
+# -------------------------
+# Collator
+# -------------------------
 class Stage2CollatorFast:
     """
     动态 padding，分别对 main/aug/neg pad。
-    labels 只对 assistant 部分算 loss：利用 preprocess 算好的 assistant_start
+    labels 只对 assistant 部分算 loss：利用 preprocess 算好的 assistant_start。
+
+    额外：把 assistant_start / augment_assistant_start / negative_assistant_start
+    也传给 trainer，用于“只池化 assistant token”的对比学习表征。
     """
     def __init__(self, tokenizer):
         self.tok = tokenizer
         self.pad = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
 
-    def __call__(self, features):
-        # 取出 scalar fields
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # starts
         starts = [int(f["assistant_start"]) for f in features]
+        aug_starts = [int(f["augment_assistant_start"]) for f in features]
+        neg_starts = [int(f["negative_assistant_start"]) for f in features]
+
+        # weights (scalar per sample)
         coin_weight = [float(f.get("coin_weight", 1.0)) for f in features]
         coin_margin = [float(f.get("coin_margin", 0.2)) for f in features]
         ips_weight = [float(f.get("ips_weight", 1.0)) for f in features]
@@ -55,41 +134,39 @@ class Stage2CollatorFast:
         batch_neg = self.pad(neg_feats)
 
         out = {
+            # main
             "input_ids": batch_main["input_ids"],
             "attention_mask": batch_main["attention_mask"],
             "labels": batch_main["labels"],
 
+            # aug
             "augment_input_ids": batch_aug["input_ids"],
             "augment_attention_mask": batch_aug["attention_mask"],
 
+            # neg
             "negative_input_ids": batch_neg["input_ids"],
             "negative_attention_mask": batch_neg["attention_mask"],
 
-            "ips_weight": ips_weight,
-            "coin_weight": coin_weight,
-            "coin_margin": coin_margin,
+            # assistant starts (for assistant-only pooling)
+            "assistant_start": torch.tensor(starts, dtype=torch.long),
+            "augment_assistant_start": torch.tensor(aug_starts, dtype=torch.long),
+            "negative_assistant_start": torch.tensor(neg_starts, dtype=torch.long),
+
+            # weights -> tensor
+            "ips_weight": torch.tensor(ips_weight, dtype=torch.float32),
+            "coin_weight": torch.tensor(coin_weight, dtype=torch.float32),
+            "coin_margin": torch.tensor(coin_margin, dtype=torch.float32),
         }
         return out
 
 
-def find_latest_checkpoint(output_dir: str) -> Optional[str]:
-    if not os.path.exists(output_dir):
-        return None
-    ckpts = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
-    if not ckpts:
-        return None
-    ckpts.sort(key=lambda x: int(x.split("-")[-1]))
-    last = ckpts[-1]
-    p = os.path.join(output_dir, last)
-    if os.path.isdir(p) and len(os.listdir(p)) > 0:
-        return p
-    return None
-
-
+# -------------------------
+# Args
+# -------------------------
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base_model", type=str, required=True)
-    ap.add_argument("--stage1_ckpt", type=str, required=True, help="Stage-1 output dir (LoRA adapter dir)")
+    ap.add_argument("--stage1_ckpt", type=str, required=True, help="Stage-1 adapter dir / checkpoint dir")
     ap.add_argument("--data_jsonl", type=str, required=True)
     ap.add_argument("--output_dir", type=str, required=True)
 
@@ -98,25 +175,44 @@ def parse_args():
 
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--grad_accum", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=2e-5)
+
+    ap.add_argument("--lr", type=float, default=1e-5)
 
     ap.add_argument("--save_steps", type=int, default=1000)
     ap.add_argument("--logging_steps", type=int, default=50)
 
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--seed", type=int, default=42)
+
+    ap.add_argument("--attn_impl", type=str, default="flash_attention_2",
+                    choices=["flash_attention_2", "sdpa", "eager"])
 
     # ---- CoIN global config ----
     ap.add_argument("--lambda_coin", type=float, default=0.10)
     ap.add_argument("--default_margin", type=float, default=0.20)
 
+    # ✅ 新增：neg_tau（阈值推离版本的负例阈值）
+    ap.add_argument(
+        "--neg_tau",
+        type=float,
+        default=0.60,
+        help="Negative similarity threshold tau for neg push-away: ReLU(sim_neg - tau). Recommended 0.50~0.65",
+    )
+
+    # ✅ view-dropout（self-positive 两视角）
+    ap.add_argument(
+        "--view_dropout",
+        type=float,
+        default=0.10,
+        help="Dropout prob applied on pos_repr twice to create two views (works even if base model has dropout=0). Recommended 0.05~0.20",
+    )
+
     # ---- hard_level -> (coin_weight, coin_margin) mapping ----
-    # 你可以用这个做“难度配比”：hard++ 给更大的 coin_weight 或更小的 margin（更严格）
     ap.add_argument("--w_easy", type=float, default=0.30)
     ap.add_argument("--w_medium", type=float, default=0.60)
     ap.add_argument("--w_hard", type=float, default=1.00)
     ap.add_argument("--w_hardpp", type=float, default=1.20)
 
-    # 注意：这里 margin 是“ranking margin”，越大越难满足 sim_pos - sim_neg >= margin
     ap.add_argument("--m_easy", type=float, default=0.10)
     ap.add_argument("--m_medium", type=float, default=0.15)
     ap.add_argument("--m_hard", type=float, default=0.20)
@@ -126,12 +222,41 @@ def parse_args():
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--pin_memory", action="store_true")
 
+    ap.add_argument("--warmup_ratio", type=float, default=0.03)
+    ap.add_argument("--warmup_steps", type=int, default=0)
+
+    ap.add_argument("--max_grad_norm", type=float, default=1.0)
+
     return ap.parse_args()
 
 
+# -------------------------
+# Main
+# -------------------------
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # -------- resume: auto align batch/accum with checkpoint --------
+    resume_ckpt = None
+    if args.resume:
+        resume_ckpt = find_latest_checkpoint(args.output_dir)
+        if resume_ckpt:
+            print(f"🔄 Resuming from {resume_ckpt}")
+            ensure_dummy_safetensors_index(resume_ckpt)
+
+            ckpt_batch_cfg = load_batch_config_from_checkpoint(resume_ckpt)
+            if ckpt_batch_cfg is not None:
+                ckpt_bs, ckpt_ga = ckpt_batch_cfg
+                if ckpt_bs != int(args.batch_size) or ckpt_ga != int(args.grad_accum):
+                    print(
+                        f"✅ Align batch config to checkpoint:\n"
+                        f"   - CLI  per_device_train_batch_size={args.batch_size}, grad_accum={args.grad_accum}\n"
+                        f"   - CKPT per_device_train_batch_size={ckpt_bs}, grad_accum={ckpt_ga}\n"
+                        f"   -> Using CKPT values to avoid mismatch warning."
+                    )
+                    args.batch_size = ckpt_bs
+                    args.grad_accum = ckpt_ga
 
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -148,7 +273,6 @@ def main():
 
     ds = load_dataset("json", data_files=args.data_jsonl, split="train")
 
-    # 映射 hard_level -> coin_weight/coin_margin
     w_map = {
         "easy": float(args.w_easy),
         "medium": float(args.w_medium),
@@ -170,29 +294,57 @@ def main():
         prompt_aug = examples.get("prompt_augment", None)
         neg_comp = examples.get("negative_completion", None)
 
-        # main
+        # -------- main --------
         prefix_texts = [USER_PREFIX_TEMPLATE.format(prompt=p) for p in prompts]
         main_texts = [pt + c + SUFFIX for pt, c in zip(prefix_texts, comps)]
-        tok_main = tokenizer(main_texts, truncation=True, max_length=args.max_length, padding=False)
-        tok_prefix = tokenizer(prefix_texts, truncation=True, max_length=args.max_length, padding=False, add_special_tokens=False)
 
-        # aug
-        if prompt_aug is None:
-            # 兜底：没有 augment 就复用 main prompt
-            aug_prompts = prompts
-        else:
-            aug_prompts = prompt_aug
+        tok_main = tokenizer(
+            main_texts,
+            truncation=True,
+            max_length=args.max_length,
+            padding=False,
+            add_special_tokens=False,
+        )
+        tok_prefix = tokenizer(
+            prefix_texts,
+            truncation=True,
+            max_length=args.max_length,
+            padding=False,
+            add_special_tokens=False,
+        )
 
+        # -------- aug --------
+        aug_prompts = prompts if prompt_aug is None else prompt_aug
         aug_prefix_texts = [USER_PREFIX_TEMPLATE.format(prompt=p) for p in aug_prompts]
         aug_texts = [pt + c + SUFFIX for pt, c in zip(aug_prefix_texts, comps)]
-        tok_aug = tokenizer(aug_texts, truncation=True, max_length=args.max_length, padding=False)
 
-        # neg
+        tok_aug = tokenizer(
+            aug_texts,
+            truncation=True,
+            max_length=args.max_length,
+            padding=False,
+            add_special_tokens=False,
+        )
+        tok_aug_prefix = tokenizer(
+            aug_prefix_texts,
+            truncation=True,
+            max_length=args.max_length,
+            padding=False,
+            add_special_tokens=False,
+        )
+
+        # -------- neg --------
         if neg_comp is None:
-            # 兜底：没有 negative 就用 completion（不推荐，但保证脚本不炸）
             neg_comp = comps
         neg_texts = [USER_PREFIX_TEMPLATE.format(prompt=p) + nc + SUFFIX for p, nc in zip(prompts, neg_comp)]
-        tok_neg = tokenizer(neg_texts, truncation=True, max_length=args.max_length, padding=False)
+
+        tok_neg = tokenizer(
+            neg_texts,
+            truncation=True,
+            max_length=args.max_length,
+            padding=False,
+            add_special_tokens=False,
+        )
 
         out = {
             "input_ids": tok_main["input_ids"],
@@ -201,18 +353,17 @@ def main():
 
             "augment_input_ids": tok_aug["input_ids"],
             "augment_attention_mask": tok_aug["attention_mask"],
+            "augment_assistant_start": [len(ids) for ids in tok_aug_prefix["input_ids"]],
 
             "negative_input_ids": tok_neg["input_ids"],
             "negative_attention_mask": tok_neg["attention_mask"],
+            "negative_assistant_start": [len(ids) for ids in tok_prefix["input_ids"]],
         }
 
         # ips_weight
-        if "ips_weight" in examples:
-            out["ips_weight"] = examples["ips_weight"]
-        else:
-            out["ips_weight"] = [1.0] * len(prompts)
+        out["ips_weight"] = examples["ips_weight"] if "ips_weight" in examples else [1.0] * len(prompts)
 
-        # coin_weight / coin_margin：优先用数据里自带，否则根据 hard_level 映射
+        # coin_weight / coin_margin
         if "coin_weight" in examples:
             out["coin_weight"] = examples["coin_weight"]
         else:
@@ -235,51 +386,54 @@ def main():
         desc="Tokenizing stage2",
     )
 
-    # base model
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float16,
         device_map="cuda",
-        attn_implementation="flash_attention_2",
+        attn_implementation=args.attn_impl,
         trust_remote_code=True,
     )
 
-    # attach LoRA (must match stage1)
-    peft_config = LoraConfig(
-        r=32, lora_alpha=64, lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, peft_config)
-
-    # load stage1 adapter weights
+    # load stage1 LoRA
     model = PeftModel.from_pretrained(model, args.stage1_ckpt, is_trainable=True)
     model.print_trainable_parameters()
+    print("peft adapters:", list(getattr(model, "peft_config", {}).keys()))
+
+    warmup_steps = int(args.warmup_steps)
+    warmup_ratio = float(args.warmup_ratio) if warmup_steps <= 0 else 0.0
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
 
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
+        per_device_train_batch_size=int(args.batch_size),
+        gradient_accumulation_steps=int(args.grad_accum),
 
-        learning_rate=args.lr,
+        learning_rate=float(args.lr),
+
+        warmup_steps=warmup_steps,
+        warmup_ratio=warmup_ratio,
+
         bf16=torch.cuda.is_available(),
         fp16=not torch.cuda.is_available(),
 
-        logging_steps=args.logging_steps,
+        logging_steps=int(args.logging_steps),
         save_strategy="steps",
-        save_steps=args.save_steps,
+        save_steps=int(args.save_steps),
         save_total_limit=3,
 
         optim="adamw_torch_fused",
         tf32=True,
 
-        dataloader_num_workers=args.num_workers,
-        dataloader_pin_memory=args.pin_memory,
+        dataloader_num_workers=int(args.num_workers),
+        dataloader_pin_memory=bool(args.pin_memory),
 
         remove_unused_columns=False,
         report_to="none",
+        seed=int(args.seed),
+
+        max_grad_norm=float(args.max_grad_norm),
+        ignore_data_skip=False,
     )
 
     collator = Stage2CollatorFast(tokenizer)
@@ -292,22 +446,24 @@ def main():
         data_collator=collator,
     )
 
-    # set trainer global coin params
+    # pass config into trainer
     trainer.lambda_coin = float(args.lambda_coin)
     trainer.default_margin = float(args.default_margin)
 
-    resume_ckpt = None
-    if args.resume:
-        resume_ckpt = find_latest_checkpoint(args.output_dir)
-        if resume_ckpt:
-            print(f"🔄 Resuming from {resume_ckpt}")
+    trainer.view_dropout = float(args.view_dropout)
+    trainer.neg_tau = float(args.neg_tau)
 
-    print("🔥 Stage-2 CoIN (RankMargin, B+C) start ...")
+    print(f"[INFO] trainer.view_dropout={trainer.view_dropout}")
+    print(f"[INFO] trainer.neg_tau={trainer.neg_tau}")
+    print(f"[INFO] batch_size={args.batch_size}, grad_accum={args.grad_accum}")
+
+    print("🔥 Stage-2 CoIN (RankMargin + view-dropout) start ...")
     trainer.train(resume_from_checkpoint=resume_ckpt)
 
     print("💾 Saving Stage-2 model ...")
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
+    print("✅ Done.")
 
 
 if __name__ == "__main__":

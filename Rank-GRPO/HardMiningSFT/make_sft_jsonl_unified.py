@@ -17,6 +17,19 @@ from SASRec import SASRec
 
 
 # =========================
+# Prompt rule (match stage1)
+# =========================
+PROMPT_RULE = "只输出一个地点名(类别)，不要解释"
+
+
+def add_rule_to_prompt(p: str) -> str:
+    p = (p or "").rstrip()
+    if PROMPT_RULE in p:
+        return p
+    return p + "\n" + PROMPT_RULE
+
+
+# =========================
 # MetaDataManager
 # =========================
 class MetaDataManager:
@@ -144,16 +157,23 @@ def make_candidate_row(gt_idx, forbid_set, n_items, pop_items, C, oversample, rn
 
     return [int(gt_idx)] + negs
 
+
 def pick_mixed_neg_from_scores(
     gt_score, cand_ids, cand_scores, forbid_set,
     neg_cap_counter, neg_cap,
-    rng, p_hard=0.7, p_semi=0.2, p_easy=0.1, semi_margin=1.0
+    rng,
+    p_hard=0.7, p_semi=0.2, p_easy=0.1, semi_margin=1.0,
+    hard_topM=10,  # NEW: hard bucket choose from topM highest-score negatives
 ):
     """
     diff = score_neg - score_gt
       hard: diff >= 0
       semi: -semi_margin <= diff < 0
       easy: diff < -semi_margin
+
+    For hard bucket:
+      - choose "most teacher-likely" negative (highest score), or sample from topM.
+      This is more likely to be "close" also under LLM hidden-space => hinge triggers more.
     """
     gt = float(gt_score)
 
@@ -193,12 +213,15 @@ def pick_mixed_neg_from_scores(
     for b in fallbacks:
         if not b:
             continue
+
         if b is hard:
-            # boundary hard: minimal positive diff
-            b_sorted = sorted(b, key=lambda x: (x[2], -x[1]))
-            chosen = b_sorted[0]
+            # NEW: pick by highest teacher score, sample from topM for diversity
+            b_sorted = sorted(b, key=lambda x: (-x[1], -x[2]))  # score desc
+            topM = b_sorted[: min(int(hard_topM), len(b_sorted))]
+            chosen = topM[int(rng.integers(0, len(topM)))]
             chosen_tag = "hard"
             break
+
         # semi/easy/any: random
         idx = int(rng.integers(0, len(b)))
         chosen = b[idx]
@@ -215,6 +238,59 @@ def pick_mixed_neg_from_scores(
 
     cid, sc, diff = chosen
     return cid, sc, chosen_tag, diff
+
+
+# =========================
+# IPS: build per-item weight table from GT distribution
+# =========================
+def build_ips_table_from_gt(raw_data_list, n_items, beta=10.0, alpha=0.5):
+    """
+    IPS based on GT(last item) frequency:
+      p(i) = (freq_gt(i) + beta) / (sum + beta*n_items)
+      w_raw(i) = (median(p)/p(i))^alpha
+      normalize so E_{gt~freq_gt}[w_raw(gt)] = 1
+    """
+    freq_gt = Counter()
+    for entry in raw_data_list:
+        seq = entry.get("sequence", [])
+        if not isinstance(seq, (list, tuple)) or len(seq) < 2:
+            continue
+        gt = int(seq[-1])
+        if gt > 0:
+            freq_gt[gt] += 1
+
+    if not freq_gt:
+        raise RuntimeError("freq_gt is empty. Cannot build IPS from GT distribution.")
+
+    total = float(sum(freq_gt.values()))
+    beta = float(beta)
+    alpha = float(alpha)
+
+    # p(i) for i in [1..n_items]
+    denom = total + beta * float(n_items)
+
+    # compute p array and p_ref(median)
+    p = np.zeros((n_items + 1,), dtype=np.float64)
+    for i in range(1, n_items + 1):
+        p[i] = (float(freq_gt.get(i, 0)) + beta) / denom
+
+    p_ref = float(np.median(p[1:]))
+
+    # raw weight table
+    w_raw = np.zeros((n_items + 1,), dtype=np.float64)
+    for i in range(1, n_items + 1):
+        w_raw[i] = (p_ref / p[i]) ** alpha
+
+    # normalize by GT distribution mean
+    # E[w_raw(gt)] = sum_i freq_gt(i)/total * w_raw(i)
+    mean_w = 0.0
+    for i, c in freq_gt.items():
+        if 1 <= int(i) <= n_items:
+            mean_w += (float(c) / total) * float(w_raw[int(i)])
+    mean_w = max(mean_w, 1e-12)
+
+    w = w_raw / mean_w
+    return w, freq_gt
 
 
 # =========================
@@ -255,10 +331,19 @@ def parse_args():
     ap.add_argument("--p_easy", type=float, default=0.1)
     ap.add_argument("--semi_margin", type=float, default=1.0)
 
+    # NEW: hard bucket selection
+    ap.add_argument("--hard_topM", type=int, default=10, help="hard bucket choose from topM teacher-highest negatives")
+
     # caps / limits
     ap.add_argument("--neg_cap", type=int, default=5000)
     ap.add_argument("--max_samples", type=int, default=0, help="0 = no limit")
     ap.add_argument("--seed", type=int, default=42)
+
+    # NEW: IPS config
+    ap.add_argument("--ips_alpha", type=float, default=0.5)
+    ap.add_argument("--ips_beta", type=float, default=10.0)
+    ap.add_argument("--ips_min", type=float, default=0.2)
+    ap.add_argument("--ips_max", type=float, default=5.0)
 
     return ap.parse_args()
 
@@ -334,8 +419,10 @@ def main():
                     skipped += 1
                     continue
 
+                prompt = add_rule_to_prompt(build_prompt(hist_texts, kind="prompt"))
+
                 sample = {
-                    "prompt": build_prompt(hist_texts, kind="prompt"),
+                    "prompt": prompt,
                     "completion": meta_mgr.get_text(gt_gmap),
                     "meta": {
                         "user_id": uid,
@@ -362,6 +449,28 @@ def main():
     # -------------------------
     # Stage2: CoIN triplets
     # -------------------------
+    # IPS table from GT distribution
+    print("🧮 Building IPS table from GT distribution ...")
+    ips_table, freq_gt = build_ips_table_from_gt(
+        raw_data_list, n_items=n_items,
+        beta=float(args.ips_beta),
+        alpha=float(args.ips_alpha),
+    )
+    print(f"✅ IPS table built. (alpha={args.ips_alpha}, beta={args.ips_beta})")
+    # quick stats on ips_table weighted by GT
+    gt_total = float(sum(freq_gt.values()))
+    ips_mean = 0.0
+    ips_min = 1e9
+    ips_max = -1e9
+    for it, c in freq_gt.items():
+        it = int(it)
+        if 1 <= it <= n_items:
+            w = float(ips_table[it])
+            ips_mean += (float(c) / gt_total) * w
+            ips_min = min(ips_min, w)
+            ips_max = max(ips_max, w)
+    print(f"✅ IPS (GT-weighted) mean={ips_mean:.4f} min={ips_min:.4f} max={ips_max:.4f}")
+
     print("🔥 Building popularity from train interactions ...")
     freq = Counter()
     t0 = time.time()
@@ -466,7 +575,7 @@ def main():
                         dtype=np.int32
                     )
 
-                # score
+                # score by teacher
                 x_t = torch.from_numpy(X).long().to(args.device, non_blocking=True)
                 cand_t = torch.from_numpy(cand).long().to(args.device, non_blocking=True)
 
@@ -502,6 +611,7 @@ def main():
                         p_semi=args.p_semi,
                         p_easy=args.p_easy,
                         semi_margin=args.semi_margin,
+                        hard_topM=args.hard_topM,
                     )
                     if picked is None:
                         skipped["no_neg"] += 1
@@ -531,8 +641,8 @@ def main():
                     gt_text = meta_mgr.get_text(gt_gmap)
                     neg_text = meta_mgr.get_text(neg_gmap)
 
-                    prompt = build_prompt(hist_texts, kind="prompt")
-                    prompt_aug = build_prompt(hist_texts, kind="augment")
+                    prompt = add_rule_to_prompt(build_prompt(hist_texts, kind="prompt"))
+                    prompt_aug = add_rule_to_prompt(build_prompt(hist_texts, kind="augment"))
 
                     gap = float(gt_score - float(neg_score_i))
                     if mix_bucket == "hard":
@@ -542,12 +652,16 @@ def main():
                     else:
                         hard_level = "medium"
 
+                    # IPS weight from table (normalized), then clip
+                    ips = float(ips_table[gt_idx_i]) if 1 <= gt_idx_i <= n_items else 1.0
+                    ips = float(np.clip(ips, float(args.ips_min), float(args.ips_max)))
+
                     sample = {
                         "prompt": prompt,
                         "prompt_augment": prompt_aug,
                         "completion": gt_text,
                         "negative_completion": neg_text,
-                        "ips_weight": 1.0,
+                        "ips_weight": ips,
 
                         "teacher_score_gt": float(gt_score),
                         "teacher_score_neg": float(neg_score_i),
@@ -571,6 +685,11 @@ def main():
                             "p_semi": float(args.p_semi),
                             "p_easy": float(args.p_easy),
                             "semi_margin": float(args.semi_margin),
+                            "hard_topM": int(args.hard_topM),
+                            "ips_alpha": float(args.ips_alpha),
+                            "ips_beta": float(args.ips_beta),
+                            "ips_min": float(args.ips_min),
+                            "ips_max": float(args.ips_max),
                         }
                     }
 

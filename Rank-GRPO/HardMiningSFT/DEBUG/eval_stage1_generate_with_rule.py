@@ -1,4 +1,4 @@
-# HardMiningSFT/eval_stage1_generate_v2.py
+# HardMiningSFT/eval_stage1_generate_with_rule.py
 import re
 import argparse
 from collections import Counter
@@ -7,58 +7,43 @@ import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
-import re
-STRICT_RE = re.compile(r"^.+\(.+\)$")
 
-def is_strict_format(s: str) -> bool:
-    if s is None:
-        return False
-    s = s.strip()
-    return bool(STRICT_RE.match(s))
 USER_PREFIX_TEMPLATE = "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 IM_END = "<|im_end|>"
 IM_START_ASSIST = "<|im_start|>assistant"
 
-# 更强的清洗：去掉各种特殊 token
+# ✅ 跟 stage1 训练保持一致
+PROMPT_RULE = "只输出一个地点名(类别)，不要解释"
+
 SPECIAL_PAT = re.compile(r"<\|[^>]+\|>")
+
+def add_rule_to_prompt(p: str) -> str:
+    p = (p or "").rstrip()
+    if PROMPT_RULE in p:
+        return p
+    return p + "\n" + PROMPT_RULE
 
 def norm_text(s: str) -> str:
     s = s.strip()
-    s = SPECIAL_PAT.sub("", s)          # remove <|...|>
+    s = SPECIAL_PAT.sub("", s)
     s = s.replace("\n", " ").strip()
     s = re.sub(r"\s+", " ", s)
-    # 去掉尾部标点/多余引号
     s = s.strip(" \t\r\n\"'`.,;:，。；：")
     return s
 
 def extract_answer(decoded: str) -> str:
-    """
-    1) 取 assistant 块
-    2) 截断到 <|im_end|> 之前
-    3) 只取“第一句/第一段”（避免啰嗦导致 exact 永远=0）
-    """
-    # 只取最后一个 assistant block（更安全）
     if IM_START_ASSIST in decoded:
         decoded = decoded.split(IM_START_ASSIST, 1)[1]
-
     if IM_END in decoded:
         decoded = decoded.split(IM_END, 1)[0]
-
     decoded = norm_text(decoded)
-
-    # 进一步截断：遇到明显的解释性分隔符就停（可按需扩展）
     for sep in [" Answer:", " Explanation:", " Because", " - ", "：", "。"]:
         if sep in decoded:
             decoded = decoded.split(sep, 1)[0].strip()
-
     return norm_text(decoded)
 
 def is_strict_format(s: str) -> bool:
-    """
-    你当前 completion 是 "Name (Category)"，用一个宽松 regex 判定
-    """
     s = s.strip()
-    # 至少包含一对括号
     return bool(re.match(r"^.+\(.+\)$", s))
 
 def parse_args():
@@ -82,37 +67,31 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
     tokenizer.padding_side = "left"
 
     base = AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float16,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float16,  # ✅ 用 torch_dtype
         device_map="cuda",
         attn_implementation=args.attn_impl,
         trust_remote_code=True,
     )
     model = PeftModel.from_pretrained(base, args.adapter, is_trainable=False).eval()
 
-    # 关键：把停止符设置成 <|im_end|>（如果 tokenizer 里存在的话）
     im_end_id = tokenizer.convert_tokens_to_ids(IM_END)
     eos_id = im_end_id if isinstance(im_end_id, int) and im_end_id >= 0 else tokenizer.eos_token_id
+    print(f"[INFO] im_end_id={im_end_id}, eos_id_used={eos_id}")
 
     ds = load_dataset("json", data_files=args.data_jsonl, split="train")
     ds = ds.shuffle(seed=args.seed).select(range(min(args.n_eval, len(ds))))
 
-    exact = 0
-    exact_norm = 0
-    contains = 0
-    strict_ok = 0
-    invalid = 0
-
+    exact = exact_norm = contains = strict_ok = invalid = 0
     out_counter = Counter()
     lens = []
 
     for st in range(0, len(ds), args.bs):
         batch = ds[st: st + args.bs]
-        prompts = batch["prompt"]
+        prompts = [add_rule_to_prompt(p) for p in batch["prompt"]]  # ✅ 加规则
         gts = batch["completion"]
 
         inputs = [USER_PREFIX_TEMPLATE.format(prompt=p) for p in prompts]
@@ -134,24 +113,18 @@ def main():
         for dec, gt in zip(decoded, gts):
             pred = extract_answer(dec)
             gt0 = norm_text(gt)
-
             if pred == "" or len(pred) < 2:
                 invalid += 1
                 continue
 
             out_counter[pred] += 1
             lens.append(len(pred.split()))
-
             if is_strict_format(pred):
                 strict_ok += 1
-
             if pred == gt0:
                 exact += 1
-
-            # 更宽松的 exact：忽略大小写 & 多余空格/标点
             if pred.lower() == gt0.lower():
                 exact_norm += 1
-
             if (gt0 in pred) or (pred in gt0):
                 contains += 1
 
@@ -159,7 +132,7 @@ def main():
     top1_pred, top1_cnt = out_counter.most_common(1)[0] if out_counter else ("", 0)
 
     print("========================================")
-    print("STAGE1 GENERATION EVAL (v2)")
+    print("STAGE1 GENERATION EVAL (with PROMPT_RULE)")
     print("========================================")
     print(f"Eval samples:         {n}")
     print(f"Exact match:          {exact}/{n} ({exact/n:.4f})")
