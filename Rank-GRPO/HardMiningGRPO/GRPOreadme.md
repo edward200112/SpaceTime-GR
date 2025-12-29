@@ -335,6 +335,53 @@ resolved_rate 稳定上升（因为有 target 注入 + disamb）
 ===
 
 
+新的调整
+✅ 调整 A：target 只能“条件注入”，不能对所有 key 强行注入
+你已经生成了 namecat2item_ids_all.json / name2item_ids_all.json，这正是正确解法：
+只有当 target_item_id ∈ all_mapping[key] 时，才把 target 注入候选。
+否则 不要注入。
+这样才能修复你之前的 target_not_in_disamb_list（top50 截断）问题，同时避免 reward leak。
+
+
+✅ 调整 A：target 只能“条件注入”，不能对所有 key 强行注入
+你已经生成了 namecat2item_ids_all.json / name2item_ids_all.json，这正是正确解法：
+只有当 target_item_id ∈ all_mapping[key] 时，才把 target 注入候选。
+否则 不要注入。
+这样才能修复你之前的 target_not_in_disamb_list（top50 截断）问题，同时避免 reward leak。
 
 
 
+python HardMiningGRPO/train_grpo.py \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
+  --train_jsonl ./HardMiningGRPO/grpo_data_v1/grpo_train.filtered.jsonl \
+  --eval_jsonl  ./HardMiningGRPO/grpo_data_v1/grpo_val.filtered.jsonl \
+  --namecat2item_disamb /workspace/Rank-GRPO/SASRec_Data/namecat2item_ids_disambiguation.json \
+  --name2item_disamb /workspace/Rank-GRPO/SASRec_Data/name2item_ids_disambiguation.json \
+  --namecat2item_all /workspace/Rank-GRPO/SASRec_Data/namecat2item_ids_all.json \
+  --name2item_all /workspace/Rank-GRPO/SASRec_Data/name2item_ids_all.json \
+  --sasrec_pkl /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec_Data/sasrec_full_latest.pt \
+  --output_dir ./HardMiningGRPO/ckpt_grpo_v6_allmap_fixleak \
+  --per_device_bs 16 --grad_accum 2 \
+  --lr 5e-6 --num_generations 8 --temperature 1.0 \
+  --alpha 0.3 --n_neg_sample 256 --softmax_temp 1.0 --format_bonus 0.05 \
+  --item_match_bonus 0.2 \
+  --extra_text_penalty 0.05 --unknown_penalty 0.05 --prefix_penalty 0.0 \
+  --max_disamb_candidates 64 --ensure_target_in_candidates \
+  --max_new_tokens 12 \
+  --sasrec_max_len 50 --sasrec_embed_dim 128 --sasrec_num_blocks 2 --sasrec_num_heads 2 --sasrec_dropout 0.2 \
+  --use_chat_template \
+  --debug_log_every_steps 20 --debug_num_show 5 \
+  --debug_dump_jsonl ./HardMiningGRPO/ckpt_grpo_v6_allmap_fixleak/debug_samples.jsonl
+
+
+✅ 新增参数：--namecat2item_all、--name2item_all
+
+✅ 修复 reward “漏洞”（target 不能无条件注入候选；item bonus 必须绑定 namecat match）
+
+✅ 保留你现有参数（--item_match_bonus、--prefix_penalty、--max_disamb_candidates、--ensure_target_in_candidates 等）
+
+✅ 兼容 TRL 的 completion 结构（string / dict 都行）
+
+✅ 继续支持 --use_chat_template 收紧生成空间

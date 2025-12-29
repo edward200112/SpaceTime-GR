@@ -32,17 +32,22 @@ def parse_args():
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--base_model", required=True)
-    ap.add_argument("--adapter", required=True, help="stage2 LoRA ckpt dir (policy init)")
+    ap.add_argument("--adapter", required=True)
     ap.add_argument("--train_jsonl", required=True)
     ap.add_argument("--eval_jsonl", required=True)
 
     ap.add_argument("--namecat2item_disamb", required=True)
     ap.add_argument("--name2item_disamb", required=True)
 
-    # optional (infer / better debug)
-    ap.add_argument("--gmap_id2namecat", type=str, default="")
-    ap.add_argument("--sasrec_pkl", required=True, help="sasrec_dataset.pkl (for n_items / id2item)")
-    ap.add_argument("--sasrec_ckpt", required=True, help="sasrec weights .pt/.pth")
+    # ✅ 新增：全量映射（用于“条件注入 target”，避免 top50 截断导致 target 不在候选）
+    ap.add_argument("--namecat2item_all", default="", help="optional: namecat2item_ids_all.json")
+    ap.add_argument("--name2item_all", default="", help="optional: name2item_ids_all.json")
+
+    # 可选：如果你后面想做更强的 canonical（暂时不强依赖）
+    ap.add_argument("--gmap_id2namecat", default="", help="optional: gmap_id2namecat.json")
+
+    ap.add_argument("--sasrec_pkl", required=True)
+    ap.add_argument("--sasrec_ckpt", required=True)
     ap.add_argument("--output_dir", required=True)
 
     # GRPO config
@@ -56,7 +61,7 @@ def parse_args():
     ap.add_argument("--num_train_epochs", type=int, default=1)
 
     # group sampling
-    ap.add_argument("--num_generations", type=int, default=8, help="GRPO group size (G)")
+    ap.add_argument("--num_generations", type=int, default=8)
     ap.add_argument("--temperature", type=float, default=1.0)
 
     # reward weights
@@ -66,16 +71,16 @@ def parse_args():
     ap.add_argument("--n_neg_sample", type=int, default=256)
     ap.add_argument("--softmax_temp", type=float, default=1.0)
 
-    # penalties (收紧输出)
+    # penalties
     ap.add_argument("--extra_text_penalty", type=float, default=0.05)
     ap.add_argument("--unknown_penalty", type=float, default=0.05)
-    ap.add_argument("--prefix_penalty", type=float, default=0.0, help="penalty if Name(Cat) not at beginning of first line")
+    ap.add_argument("--prefix_penalty", type=float, default=0.0)
 
-    # disamb speed control
+    # disamb controls
     ap.add_argument("--max_disamb_candidates", type=int, default=64)
     ap.add_argument("--ensure_target_in_candidates", action="store_true")
 
-    # sasrec arch (must match training)
+    # sasrec arch
     ap.add_argument("--sasrec_embed_dim", type=int, default=128)
     ap.add_argument("--sasrec_num_blocks", type=int, default=2)
     ap.add_argument("--sasrec_num_heads", type=int, default=2)
@@ -83,12 +88,8 @@ def parse_args():
     ap.add_argument("--sasrec_max_len", type=int, default=50)
 
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument(
-        "--attn_impl",
-        type=str,
-        default="flash_attention_2",
-        choices=["flash_attention_2", "sdpa", "eager"],
-    )
+    ap.add_argument("--attn_impl", type=str, default="flash_attention_2",
+                    choices=["flash_attention_2", "sdpa", "eager"])
 
     # debug
     ap.add_argument("--debug_log_every_steps", type=int, default=0)
@@ -96,8 +97,7 @@ def parse_args():
     ap.add_argument("--debug_dump_jsonl", type=str, default="")
     ap.add_argument("--debug_print_full_completion", action="store_true")
 
-    # use chat template
-    ap.add_argument("--use_chat_template", action="store_true", help="wrap prompt with Qwen chat template")
+    ap.add_argument("--use_chat_template", action="store_true")
 
     return ap.parse_args()
 
@@ -109,7 +109,6 @@ def seed_everything(seed: int):
 
 
 def build_chat_prompt(tok, user_text: str) -> str:
-    """Wrap raw user_text to Qwen chat format, add generation prompt."""
     messages = [{"role": "user", "content": user_text}]
     if hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None):
         return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -120,11 +119,11 @@ def load_sasrec_from_ckpt(
     sasrec_pkl: str,
     sasrec_ckpt: str,
     device: str,
-    max_len: int = 50,
-    embed_dim: int = 128,
-    num_blocks: int = 2,
-    num_heads: int = 2,
-    dropout: float = 0.2,
+    max_len: int,
+    embed_dim: int,
+    num_blocks: int,
+    num_heads: int,
+    dropout: float,
 ):
     import pickle
 
@@ -149,14 +148,15 @@ def load_sasrec_from_ckpt(
     else:
         state_dict = ckpt_obj
 
+    # sanity
     if "item_emb.weight" in state_dict:
         ckpt_dim = int(state_dict["item_emb.weight"].shape[1])
         if ckpt_dim != int(embed_dim):
-            raise ValueError(f"SASRec embed_dim mismatch: ckpt_dim={ckpt_dim} vs args.embed_dim={embed_dim}")
+            raise ValueError(f"SASRec embed_dim mismatch: ckpt_dim={ckpt_dim} vs embed_dim={embed_dim}")
     if "pos_emb.weight" in state_dict:
         ckpt_len = int(state_dict["pos_emb.weight"].shape[0])
         if ckpt_len != int(max_len):
-            raise ValueError(f"SASRec max_len mismatch: ckpt_max_len={ckpt_len} vs args.max_len={max_len}")
+            raise ValueError(f"SASRec max_len mismatch: ckpt_len={ckpt_len} vs max_len={max_len}")
 
     class _Args:
         pass
@@ -171,15 +171,12 @@ def load_sasrec_from_ckpt(
 
     sasrec = SASRec(item_num=n_items, args=a).to(device)
     sasrec.load_state_dict(state_dict, strict=True)
-
     sasrec.eval()
     for p in sasrec.parameters():
         p.requires_grad_(False)
 
-    print(
-        f"[OK] loaded SASRec: n_items={n_items}, max_len={a.max_len}, dim={a.embed_dim}, "
-        f"blocks={a.num_blocks}, heads={a.num_heads}, dropout={a.dropout}"
-    )
+    print(f"[OK] loaded SASRec: n_items={n_items}, max_len={a.max_len}, dim={a.embed_dim}, "
+          f"blocks={a.num_blocks}, heads={a.num_heads}, dropout={a.dropout}")
     return sasrec, n_items
 
 
@@ -192,28 +189,30 @@ def main():
     generation_batch_size = int(args.per_device_bs) * int(args.grad_accum)
     if generation_batch_size % int(args.num_generations) != 0:
         raise ValueError(
-            f"[BAD CONFIG] per_device_bs*grad_accum={generation_batch_size} must be divisible by num_generations={args.num_generations}."
+            f"[BAD CONFIG] per_device_bs*grad_accum={generation_batch_size} "
+            f"must be divisible by num_generations={args.num_generations}"
         )
 
     # tokenizer
     tok = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    tok.padding_side = "left"  # generation-friendly
+    tok.padding_side = "left"
 
     # model + lora
+    device_map = "cuda" if torch.cuda.is_available() else None
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        device_map="cuda",
-        dtype=dtype,
+        device_map=device_map,
+        dtype=dtype,  # 你环境里 torch_dtype 已 deprecated，这里用 dtype
         trust_remote_code=True,
         attn_implementation=args.attn_impl,
     )
     model = PeftModel.from_pretrained(model, args.adapter, is_trainable=True)
     model.print_trainable_parameters()
 
-    # generation config: align pad/eos
+    # generation config tokens
     eos_ids = []
     if tok.eos_token_id is not None:
         eos_ids.append(int(tok.eos_token_id))
@@ -226,7 +225,7 @@ def main():
             pass
     eos_ids = sorted(set(eos_ids)) if eos_ids else None
     if eos_ids is not None:
-        model.generation_config.eos_token_id = eos_ids  # list is OK
+        model.generation_config.eos_token_id = eos_ids
     model.generation_config.pad_token_id = int(tok.pad_token_id)
 
     # dataset
@@ -237,11 +236,12 @@ def main():
         raw = ex["prompt"]
         if RULE not in raw:
             raw = raw.rstrip() + "\n" + RULE
+
         prompt = build_chat_prompt(tok, raw) if args.use_chat_template else raw
 
         out = {
             "prompt": prompt,
-            "prompt_raw": raw,  # debug
+            "prompt_raw": raw,  # debug用
             "history_item_ids": ex["history_item_ids"],
             "target_item_id": ex["target_item_id"],
         }
@@ -268,15 +268,16 @@ def main():
     namecat2item_disamb = load_json(args.namecat2item_disamb)
     name2item_disamb = load_json(args.name2item_disamb)
 
-    gmap_id2namecat = load_json(args.gmap_id2namecat) if args.gmap_id2namecat else None
+    namecat2item_all = load_json(args.namecat2item_all) if args.namecat2item_all else {}
+    name2item_all = load_json(args.name2item_all) if args.name2item_all else {}
 
     resolver = SasrecResolver(
         sasrec_model=sasrec,
         n_items=n_items,
         namecat2item_disamb=namecat2item_disamb,
         name2item_disamb=name2item_disamb,
-        sasrec_pkl_path=args.sasrec_pkl,   # for id2item
-        gmap_id2namecat=gmap_id2namecat,   # optional, for target_namecat derivation
+        namecat2item_all=namecat2item_all,
+        name2item_all=name2item_all,
         device=device,
     )
 
@@ -286,6 +287,7 @@ def main():
         alpha=float(args.alpha),
         format_bonus=float(args.format_bonus),
         item_match_bonus=float(args.item_match_bonus),
+
         extra_text_penalty=float(args.extra_text_penalty),
         unknown_penalty=float(args.unknown_penalty),
         prefix_penalty=float(args.prefix_penalty),
@@ -298,7 +300,6 @@ def main():
         debug_dump_jsonl=str(args.debug_dump_jsonl),
         debug_print_full_completion=bool(args.debug_print_full_completion),
     )
-
     reward_fn = make_reward_fn(resolver, r_cfg)
 
     grpo_cfg = GRPOConfig(
