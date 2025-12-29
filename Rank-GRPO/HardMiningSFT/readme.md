@@ -1499,18 +1499,32 @@ python HardMiningSFT/train_stage2_coin_rankmargin.py \
 eval
 python HardMiningSFT/eval_stage1_beam_oracle.py \
   --base_model /workspace/Qwen2_5-1.5B-Instruct \
-  --adapter ./HardMiningSFT/ckpt_stage2_retrain_for_grpo_bs32/checkpoint-4500 \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
   --data_jsonl ./HardMiningSFT/sft_data/google_stage2_coin_800k_ips_rule_hard_strongerIPS.jsonl \
   --n_eval 5000 --bs 16 --max_new_tokens 48 --num_beams 10 \
   --report_top1_ratio --report_topk 10
 
 python HardMiningSFT/eval_stage1_beam_oracle.py \
   --base_model /workspace/Qwen2_5-1.5B-Instruct \
-  --adapter ./HardMiningSFT/ckpt_stage2_retrain_for_grpo_bs32/checkpoint-4500 \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
   --data_jsonl ./HardMiningSFT/sft_data/google_stage1_pos_2m.jsonl \
   --n_eval 5000 --bs 16 --max_new_tokens 48 --num_beams 10 \
   --report_top1_ratio --report_topk 10
 
+new train eval
+python HardMiningSFT/eval_stage1_beam_oracle.py \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500_retrain_discovery/checkpoint-4000 \
+  --data_jsonl ./HardMiningSFT/sft_data/google_stage2_coin_800k_ips_rule_hard_strongerIPS.jsonl \
+  --n_eval 5000 --bs 16 --max_new_tokens 48 --num_beams 10 \
+  --report_top1_ratio --report_topk 10
+
+python HardMiningSFT/eval_stage1_beam_oracle.py \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500_retrain_discovery/checkpoint-4000 \
+  --data_jsonl ./HardMiningSFT/sft_data/google_stage1_pos_2m.jsonl \
+  --n_eval 5000 --bs 16 --max_new_tokens 48 --num_beams 10 \
+  --report_top1_ratio --report_topk 10
 
 
 
@@ -1533,3 +1547,30 @@ python HardMiningSFT/train_stage2_coin_rankmargin.py \
   --attn_impl flash_attention_2 \
   --pin_memory \
   --resume
+
+
+
+
+抬 oracle@10”的弱化 CoIN 微调
+python HardMiningSFT/train_stage2_coin_rankmargin.py \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --stage1_ckpt ./HardMiningSFT/ckpt_stage2_retrain_for_grpo_bs32/checkpoint-2500 \
+  --data_jsonl ./HardMiningSFT/sft_data/google_stage2_coin_800k_ips_rule_hard_strongerIPS.jsonl \
+  --output_dir ./HardMiningSFT/ckpt_stage2_coinweak_from2500_retrain_discovery \
+  --num_epochs 1 \
+  --max_length 1024 \
+  --batch_size 12 \
+  --grad_accum 2 \
+  --lr 5e-6 \
+  --warmup_ratio 0.02 \
+  --save_steps 500 \
+  --logging_steps 50 \
+  --lambda_coin 0.03 \
+  --view_dropout 0.05 \
+  --neg_tau 0.55 \
+  --attn_impl flash_attention_2 \
+  --pin_memory \
+  --resume
+
+
+
