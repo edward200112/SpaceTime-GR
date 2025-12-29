@@ -470,3 +470,46 @@ casefold match（大小写/部分符号容错）
 
 
 
+✅ train_grpo.py
+强制 tok.truncation_side="left"（候选在尾部，必须保尾）
+dataset 字段做 alias 兼容（candidates_namecat / candidate_namecats 等都能吃）
+增加两个 reward 相关参数透传：--in_candidates_bonus、--incomplete_penalty
+默认 max_new_tokens 提高到 32（你也可以 CLI 覆盖）
+
+✅ reward_sasrec.py
+Name (Cat) 解析失败时，额外检测 “括号没闭合/明显截断” → incomplete_penalty
+候选匹配支持：
+exact（严格 canonical）
+fold（大小写/符号差异折叠匹配，解决 sweetFrog 这种）
+增加 in_candidates_bonus（让模型先学会“只从候选里选”，再学会“选对”）
+Debug 里输出 exact_in / fold_in 方便你判断到底在学什么
+
+
+
+python HardMiningGRPO/train_grpo.py \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
+  --train_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.cand.fixed_precise_v2.jsonl \
+  --eval_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_val.cand.fixed_precise_v2.jsonl \
+  --sasrec_pkl /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec_Data/sasrec_full_latest.pt \
+  --output_dir ./HardMiningGRPO/ckpt_grpo_candidates_best_v1 \
+  --per_device_bs 16 --grad_accum 2 \
+  --lr 5e-6 --num_generations 8 \
+  --max_length 1280 --max_new_tokens 32 \
+  --temperature 0.7 \
+  --format_bonus 0.05 --in_candidates_bonus 0.10 --match_reward 1.0 \
+  --alpha 0.3 --softmax_temp 1.0 \
+  --extra_text_penalty 0.05 --unknown_penalty 0.10 --prefix_penalty 0.05 --incomplete_penalty 0.10 \
+  --use_chat_template \
+  --debug_log_every_steps 20 --debug_num_show 5 \
+  --debug_dump_jsonl ./HardMiningGRPO/ckpt_grpo_candidates_best_v1/debug_samples.jsonl
+
+[OK] loaded SASRec: n_items=992862, max_len=50, dim=128, blocks=2, heads=2, dropout=0.2
+Traceback (most recent call last):
+  File "/workspace/Rank-GRPO/HardMiningGRPO/train_grpo.py", line 314, in <module>
+    main()
+  File "/workspace/Rank-GRPO/HardMiningGRPO/train_grpo.py", line 263, in main
+    r_cfg = ResolverConfig(
+            ^^^^^^^^^^^^^^^
+TypeError: ResolverConfig.__init__() got an unexpected keyword argument 'in_candidates_bonus'

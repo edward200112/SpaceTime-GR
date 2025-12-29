@@ -3,7 +3,7 @@ import os
 import sys
 import argparse
 import random
-from typing import List
+from typing import Any, Dict
 
 import torch
 from datasets import load_dataset
@@ -22,6 +22,9 @@ from HardMiningGRPO.reward_sasrec import SasrecScorer, ResolverConfig, make_rewa
 # fallback template（当 tokenizer 没有 chat_template 时）
 USER_PREFIX_TEMPLATE = "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
+# 如果你的 prompt 里已经包含候选+规则，这里不强加，只做兜底
+RULE_FALLBACK = "只能从下面候选列表中选择一个，并且原样只输出一个地点名(类别)，不要解释。"
+
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -36,8 +39,8 @@ def parse_args():
     ap.add_argument("--output_dir", required=True)
 
     # GRPO
-    ap.add_argument("--max_length", type=int, default=1024)
-    ap.add_argument("--max_new_tokens", type=int, default=8)
+    ap.add_argument("--max_length", type=int, default=1280)
+    ap.add_argument("--max_new_tokens", type=int, default=32)  # ✅ 默认拉大，避免截断导致 unknown 飙升
     ap.add_argument("--per_device_bs", type=int, default=16)
     ap.add_argument("--grad_accum", type=int, default=2)
     ap.add_argument("--lr", type=float, default=5e-6)
@@ -46,16 +49,20 @@ def parse_args():
     ap.add_argument("--num_train_epochs", type=int, default=1)
 
     ap.add_argument("--num_generations", type=int, default=8)
-    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--temperature", type=float, default=0.7)  # ✅ 默认稍低一点更稳
 
     # reward cfg
-    ap.add_argument("--format_bonus", type=float, default=0.02)
+    ap.add_argument("--format_bonus", type=float, default=0.05)
+    ap.add_argument("--in_candidates_bonus", type=float, default=0.10)  # ✅ 关键：先学会只从候选里选
     ap.add_argument("--match_reward", type=float, default=1.0)
-    ap.add_argument("--alpha", type=float, default=0.1)
+
+    ap.add_argument("--alpha", type=float, default=0.3)
     ap.add_argument("--softmax_temp", type=float, default=1.0)
+
     ap.add_argument("--extra_text_penalty", type=float, default=0.05)
-    ap.add_argument("--unknown_penalty", type=float, default=0.05)
+    ap.add_argument("--unknown_penalty", type=float, default=0.10)
     ap.add_argument("--prefix_penalty", type=float, default=0.05)
+    ap.add_argument("--incomplete_penalty", type=float, default=0.10)  # ✅ 括号没闭合/截断的罚
 
     # sasrec arch
     ap.add_argument("--sasrec_embed_dim", type=int, default=128)
@@ -157,6 +164,15 @@ def load_sasrec_from_ckpt(
     return sasrec
 
 
+def _get_field(ex: Dict[str, Any], keys, required=True, default=None):
+    for k in keys:
+        if k in ex:
+            return ex[k]
+    if required:
+        raise KeyError(f"missing required field, tried: {keys}")
+    return default
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -174,6 +190,7 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
+    tok.truncation_side = "left"  # ✅ 候选在尾部，必须保尾部
 
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
     model = AutoModelForCausalLM.from_pretrained(
@@ -205,26 +222,30 @@ def main():
     train_ds = load_dataset("json", data_files=args.train_jsonl, split="train")
     eval_ds = load_dataset("json", data_files=args.eval_jsonl, split="train")
 
-    required = ["prompt", "history_item_ids", "target_item_id", "target_namecat", "candidate_namecats", "candidate_item_ids"]
-    for r in required:
-        if r not in train_ds.column_names:
-            raise ValueError(f"train_jsonl missing field: {r}")
+    def format_ex(ex: Dict[str, Any]) -> Dict[str, Any]:
+        raw = _get_field(ex, ["prompt"])
+        # 兜底：如果有人生成数据漏了规则
+        if "只输出一个地点名" not in raw:
+            raw = raw.rstrip() + "\n" + RULE_FALLBACK
 
-    def format_ex(ex):
-        raw = ex["prompt"]
-        prompt = build_chat_prompt(tok, raw) if args.use_chat_template else raw
-        return {
-            "prompt": prompt,
+        cand_nc = _get_field(ex, ["candidate_namecats", "candidates_namecat", "candidates_namecats"])
+        cand_it = _get_field(ex, ["candidate_item_ids", "candidates_item_ids", "candidates_ids"])
+
+        out = {
+            "prompt": build_chat_prompt(tok, raw) if args.use_chat_template else raw,
             "prompt_raw": raw,
-            "history_item_ids": ex["history_item_ids"],
-            "target_item_id": ex["target_item_id"],
-            "target_namecat": ex["target_namecat"],
-            "candidate_namecats": ex["candidate_namecats"],
-            "candidate_item_ids": ex["candidate_item_ids"],
+            "history_item_ids": _get_field(ex, ["history_item_ids"]),
+            "target_item_id": _get_field(ex, ["target_item_id"]),
+            "target_namecat": _get_field(ex, ["target_namecat"]),
+            "candidate_namecats": cand_nc,
+            "candidate_item_ids": cand_it,
         }
+        return out
 
-    train_ds = train_ds.map(format_ex, remove_columns=train_ds.column_names)
-    eval_ds = eval_ds.map(format_ex, remove_columns=eval_ds.column_names)
+    # map 用 num_proc 加速（不影响 determinism）
+    num_proc = max(1, (os.cpu_count() or 8) // 2)
+    train_ds = train_ds.map(format_ex, remove_columns=train_ds.column_names, num_proc=num_proc)
+    eval_ds = eval_ds.map(format_ex, remove_columns=eval_ds.column_names, num_proc=num_proc)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     sasrec = load_sasrec_from_ckpt(
@@ -241,12 +262,14 @@ def main():
 
     r_cfg = ResolverConfig(
         format_bonus=float(args.format_bonus),
+        in_candidates_bonus=float(args.in_candidates_bonus),
         match_reward=float(args.match_reward),
         alpha=float(args.alpha),
         softmax_temp=float(args.softmax_temp),
         extra_text_penalty=float(args.extra_text_penalty),
         unknown_penalty=float(args.unknown_penalty),
         prefix_penalty=float(args.prefix_penalty),
+        incomplete_penalty=float(args.incomplete_penalty),
         debug_log_every_steps=int(args.debug_log_every_steps),
         debug_num_show=int(args.debug_num_show),
         debug_dump_jsonl=str(args.debug_dump_jsonl),
