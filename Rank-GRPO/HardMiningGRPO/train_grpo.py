@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Tuple
 from collections import Counter
 
 import torch
+import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
@@ -58,30 +59,28 @@ def parse_args():
     ap.add_argument("--num_generations", type=int, default=8)
     ap.add_argument("--temperature", type=float, default=0.9)
 
-    # ✅ 强制打破“第一个就是 GT”的捷径
-    ap.add_argument(
-        "--shuffle_candidates",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Deterministically shuffle candidates per sample AND rewrite prompt candidate list accordingly.",
-    )
+    # eval HR
+    ap.add_argument("--eval_steps", type=int, default=100)
+    ap.add_argument("--eval_max_samples", type=int, default=2000, help="<=0 means use full eval set.")
+    ap.add_argument("--eval_prompt_bs", type=int, default=4, help="how many prompts per eval batch.")
+    ap.add_argument("--eval_score_bs", type=int, default=64, help="how many (prompt,cand) sequences per forward.")
+    ap.add_argument("--eval_length_norm", action=argparse.BooleanOptionalAction, default=True)
+
+    # ✅ 去捷径：打散 candidates，并同步重写 prompt 的候选段
+    ap.add_argument("--shuffle_candidates", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--print_target_pos_hist", action="store_true")
 
-    # reward cfg
+    # reward (HR-aligned version should be in reward_sasrec.py)
     ap.add_argument("--format_bonus", type=float, default=0.05)
-    ap.add_argument("--in_candidates_bonus", type=float, default=0.10)
+    ap.add_argument("--in_candidates_bonus", type=float, default=0.05)
 
-    ap.add_argument("--match_reward_exact", type=float, default=0.25)
-    ap.add_argument("--match_reward_fold", type=float, default=0.03)
-
-    ap.add_argument("--alpha", type=float, default=0.6)
+    ap.add_argument("--correct_reward", type=float, default=2.0)
+    ap.add_argument("--wrong_penalty", type=float, default=0.3)
+    ap.add_argument("--unknown_penalty", type=float, default=0.6)
+    ap.add_argument("--rank_shaping_weight", type=float, default=0.2)
     ap.add_argument("--softmax_temp", type=float, default=1.0)
-    ap.add_argument("--teacher_mode", type=str, default="zscore",
-                    choices=["zscore", "logprob", "prob", "rank"])
-    ap.add_argument("--teacher_clip", type=float, default=5.0)
 
     ap.add_argument("--extra_text_penalty", type=float, default=0.05)
-    ap.add_argument("--unknown_penalty", type=float, default=0.10)
     ap.add_argument("--prefix_penalty", type=float, default=0.05)
     ap.add_argument("--incomplete_penalty", type=float, default=0.10)
     ap.add_argument("--copy_penalty", type=float, default=0.08)
@@ -160,29 +159,20 @@ def _build_candidate_block(cands: List[str]) -> str:
 
 
 def _rewrite_prompt_candidates(raw_prompt: str, cand_namecats: List[str]) -> str:
-    """
-    ✅ 关键：prompt 里本来就包含候选列表，并且你数据里 GT 总是第一个
-    所以必须把 prompt 的候选段落也替换成 shuffle 后的顺序，才能消除捷径。
-    """
     p = (raw_prompt or "").rstrip()
     new_block = _build_candidate_block(cand_namecats)
 
-    # 找到任意一个候选 header，截断并替换其后的候选列表
     hit_pos = -1
-    hit_hdr = None
     for hdr in CAND_HEADERS:
         pos = p.find(hdr)
         if pos != -1:
             hit_pos = pos
-            hit_hdr = hdr
             break
 
     if hit_pos != -1:
         prefix = p[:hit_pos].rstrip()
-        # 保留 prefix，然后用 canonical block 覆盖
         return (prefix + "\n" + new_block).rstrip()
 
-    # 如果原 prompt 没有候选段，就直接追加
     return (p + "\n" + new_block).rstrip()
 
 
@@ -250,11 +240,244 @@ def load_sasrec_from_ckpt(
     return sasrec
 
 
+# -------------------------
+# HR@K evaluation utilities
+# -------------------------
+
+@torch.no_grad()
+def _score_sequences_avg_logprob(
+    model,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+    length_norm: bool = True,
+) -> torch.Tensor:
+    """
+    Return score per sequence: average logprob over labeled tokens (higher is better).
+    labels: same shape as input_ids, with -100 for ignore, token ids for scored positions.
+    """
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    logits = outputs.logits  # [B, L, V]
+    # shift
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()  # predict token t from logits t-1
+    B, Lm1 = shift_labels.shape
+
+    # CE per token (ignore -100)
+    loss = F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        reduction="none",
+        ignore_index=-100,
+    ).view(B, Lm1)
+
+    mask = (shift_labels != -100).float()
+    tok_cnt = mask.sum(dim=1).clamp_min(1.0)
+    nll = (loss * mask).sum(dim=1)  # negative log likelihood
+    if length_norm:
+        return -(nll / tok_cnt)
+    return -nll
+
+
+def _encode_prompt_and_candidate(tok, prompt: str, cand: str):
+    # add_special_tokens=False because prompt already contains chat markers if any
+    p_ids = tok.encode(prompt, add_special_tokens=False)
+    c_ids = tok.encode(cand, add_special_tokens=False)
+    return p_ids, c_ids
+
+
+@torch.no_grad()
+def score_candidates_for_prompts(
+    model,
+    tok,
+    prompts: List[str],
+    candidates: List[List[str]],
+    max_total_len: int,
+    score_bs: int,
+    device: str,
+    length_norm: bool = True,
+) -> torch.Tensor:
+    """
+    Return scores tensor [B, K] where K = len(candidates[b]).
+    """
+    B = len(prompts)
+    K = len(candidates[0])
+    assert all(len(x) == K for x in candidates), "Eval expects fixed K per sample."
+
+    # build flattened sequences
+    flat_input_ids = []
+    flat_labels = []
+    flat_attn = []
+
+    for b in range(B):
+        prompt = prompts[b]
+        for k in range(K):
+            cand = candidates[b][k]
+            p_ids, c_ids = _encode_prompt_and_candidate(tok, prompt, cand)
+
+            # concat
+            ids = p_ids + c_ids
+            # truncate from left to keep tail (important for candidates near end)
+            if len(ids) > max_total_len:
+                ids = ids[-max_total_len:]
+                # if truncated, prompt_len shrinks; but we must score only candidate tokens.
+                # We approximate: ensure we always keep full candidate tokens by
+                # forcing last len(c_ids) tokens to be candidate tokens if possible.
+                if len(c_ids) <= max_total_len:
+                    ids = ids[:-len(c_ids)] + c_ids
+
+            # recompute prompt_len inside truncated sequence
+            # assume candidate tokens are the last len(c_ids) tokens (enforced above)
+            cand_len = min(len(c_ids), len(ids))
+            prompt_len = len(ids) - cand_len
+
+            labels = [-100] * len(ids)
+            for t in range(prompt_len, len(ids)):
+                labels[t] = ids[t]
+
+            flat_input_ids.append(ids)
+            flat_labels.append(labels)
+
+    # pad right
+    pad_id = int(tok.pad_token_id)
+    max_len = max(len(x) for x in flat_input_ids)
+    for i in range(len(flat_input_ids)):
+        ids = flat_input_ids[i]
+        lab = flat_labels[i]
+        attn = [1] * len(ids)
+        if len(ids) < max_len:
+            pad_n = max_len - len(ids)
+            ids = ids + [pad_id] * pad_n
+            lab = lab + [-100] * pad_n
+            attn = attn + [0] * pad_n
+        flat_input_ids[i] = ids
+        flat_labels[i] = lab
+        flat_attn.append(attn)
+
+    input_ids = torch.tensor(flat_input_ids, dtype=torch.long, device=device)
+    labels = torch.tensor(flat_labels, dtype=torch.long, device=device)
+    attn = torch.tensor(flat_attn, dtype=torch.long, device=device)
+
+    # score in chunks
+    scores = []
+    N = input_ids.size(0)
+    for s in range(0, N, score_bs):
+        e = min(N, s + score_bs)
+        sc = _score_sequences_avg_logprob(
+            model,
+            input_ids[s:e],
+            attn[s:e],
+            labels[s:e],
+            length_norm=length_norm,
+        )
+        scores.append(sc.detach().float().cpu())
+    scores = torch.cat(scores, dim=0)  # [B*K]
+    return scores.view(B, K)
+
+
+@torch.no_grad()
+def compute_hr_at_k(
+    model,
+    tok,
+    eval_ds,
+    max_samples: int,
+    prompt_bs: int,
+    score_bs: int,
+    max_total_len: int,
+    device: str,
+    length_norm: bool = True,
+) -> Dict[str, float]:
+    n = len(eval_ds)
+    if max_samples and max_samples > 0:
+        n = min(n, int(max_samples))
+
+    hr1_hit = 0
+    hr10_hit = 0
+    total = 0
+
+    model_was_train = model.training
+    model.eval()
+
+    # eval in batches of prompts
+    for st in range(0, n, prompt_bs):
+        ed = min(n, st + prompt_bs)
+        batch = eval_ds.select(range(st, ed))
+
+        prompts = list(batch["prompt"])
+        candidates = list(batch["candidate_namecats"])
+        tgt_pos = torch.tensor(batch["target_pos"], dtype=torch.long)
+
+        # score [B,K]
+        sc = score_candidates_for_prompts(
+            model=model,
+            tok=tok,
+            prompts=prompts,
+            candidates=candidates,
+            max_total_len=max_total_len,
+            score_bs=score_bs,
+            device=device,
+            length_norm=length_norm,
+        )
+
+        top10 = torch.topk(sc, k=min(10, sc.size(1)), dim=1).indices  # [B,10]
+        top1 = top10[:, 0]
+
+        hr1_hit += int((top1 == tgt_pos).sum().item())
+        hr10_hit += int((top10 == tgt_pos.unsqueeze(1)).any(dim=1).sum().item())
+        total += (ed - st)
+
+    if model_was_train:
+        model.train()
+
+    return {
+        "eval_hr1": hr1_hit / max(1, total),
+        "eval_hr10": hr10_hit / max(1, total),
+        "eval_samples": float(total),
+    }
+
+
+class GRPOTrainerWithHREval(GRPOTrainer):
+    """
+    Let Trainer's built-in evaluation loop call this every eval_steps.
+    """
+    def __init__(self, *args, tokenizer=None, eval_max_samples=0, eval_prompt_bs=4, eval_score_bs=64,
+                 eval_length_norm=True, max_total_len=1408, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._hr_tok = tokenizer
+        self._eval_max_samples = int(eval_max_samples)
+        self._eval_prompt_bs = int(eval_prompt_bs)
+        self._eval_score_bs = int(eval_score_bs)
+        self._eval_length_norm = bool(eval_length_norm)
+        self._max_total_len = int(max_total_len)
+
+    def evaluate(self, eval_dataset=None, **kwargs):
+        ds = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if ds is None:
+            return {}
+
+        device = next(self.model.parameters()).device
+        metrics = compute_hr_at_k(
+            model=self.model,
+            tok=self._hr_tok,
+            eval_ds=ds,
+            max_samples=self._eval_max_samples,
+            prompt_bs=self._eval_prompt_bs,
+            score_bs=self._eval_score_bs,
+            max_total_len=self._max_total_len,
+            device=str(device),
+            length_norm=self._eval_length_norm,
+        )
+        # Trainer will log/print returned metrics
+        self.log(metrics)
+        return metrics
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     seed_everything(args.seed)
 
+    # TRL constraint: per_device_bs*grad_accum must be divisible by num_generations
     generation_batch_size = int(args.per_device_bs) * int(args.grad_accum)
     if generation_batch_size % int(args.num_generations) != 0:
         raise ValueError(
@@ -266,7 +489,7 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
-    tok.truncation_side = "left"  # 候选在尾部，必须保尾部
+    tok.truncation_side = "left"
 
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
     model = AutoModelForCausalLM.from_pretrained(
@@ -279,6 +502,7 @@ def main():
     model = PeftModel.from_pretrained(model, args.adapter, is_trainable=True)
     model.print_trainable_parameters()
 
+    # stop tokens
     eos_ids = []
     if tok.eos_token_id is not None:
         eos_ids.append(int(tok.eos_token_id))
@@ -301,7 +525,6 @@ def main():
         raw = _get_field(ex, ["prompt"])
         raw = (raw or "").rstrip()
 
-        # 兜底：确保规则存在
         if "只输出一个地点名" not in raw:
             raw = (raw + "\n" + RULE_FALLBACK).rstrip()
 
@@ -323,7 +546,6 @@ def main():
         if tgt_pos < 0:
             raise ValueError("[BAD DATA] target_namecat not found in candidate_namecats. Ensure GT is included in candidates.")
 
-        # ✅ 关键：重写 prompt 里的候选列表，顺序与 cand_nc2 一致（否则捷径还在）
         raw2 = _rewrite_prompt_candidates(raw, cand_nc2)
 
         out = {
@@ -370,16 +592,14 @@ def main():
         format_bonus=float(args.format_bonus),
         in_candidates_bonus=float(args.in_candidates_bonus),
 
-        match_reward_exact=float(args.match_reward_exact),
-        match_reward_fold=float(args.match_reward_fold),
+        correct_reward=float(args.correct_reward),
+        wrong_penalty=float(args.wrong_penalty),
+        unknown_penalty=float(args.unknown_penalty),
+        rank_shaping_weight=float(args.rank_shaping_weight),
 
-        alpha=float(args.alpha),
         softmax_temp=float(args.softmax_temp),
-        teacher_mode=str(args.teacher_mode),
-        teacher_clip=float(args.teacher_clip),
 
         extra_text_penalty=float(args.extra_text_penalty),
-        unknown_penalty=float(args.unknown_penalty),
         prefix_penalty=float(args.prefix_penalty),
         incomplete_penalty=float(args.incomplete_penalty),
         copy_penalty=float(args.copy_penalty),
@@ -392,6 +612,7 @@ def main():
     )
     reward_fn = make_reward_fn(scorer, r_cfg)
 
+    # GRPO config
     grpo_cfg = GRPOConfig(
         output_dir=args.output_dir,
         learning_rate=float(args.lr),
@@ -408,15 +629,30 @@ def main():
         max_completion_length=int(args.max_new_tokens),
         num_generations=int(args.num_generations),
         temperature=float(args.temperature),
+
+        # ✅ 每 100 step 自动触发 evaluate()
+        evaluation_strategy="steps",
+        eval_steps=int(args.eval_steps),
     )
 
-    trainer = GRPOTrainer(
+    # total len for scoring prompt+candidate
+    # (prompt max_length + completion max_new_tokens) is usually safe
+    max_total_len = int(args.max_length) + int(args.max_new_tokens)
+
+    trainer = GRPOTrainerWithHREval(
         model=model,
         args=grpo_cfg,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         processing_class=tok,
         reward_funcs=reward_fn,
+
+        tokenizer=tok,
+        eval_max_samples=args.eval_max_samples,
+        eval_prompt_bs=args.eval_prompt_bs,
+        eval_score_bs=args.eval_score_bs,
+        eval_length_norm=args.eval_length_norm,
+        max_total_len=max_total_len,
     )
 
     trainer.train()

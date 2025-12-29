@@ -603,12 +603,15 @@ reward_std: 0.26（组内有差异，GRPO 能做相对优化）✅
 group_unique_rate≈0.875（开始有些重复，但还远不到塌缩；而且你有 duplicate penalty 在控）✅
 
 
-你现在：
-in_candidates_rate: 0.031 → 0.250(step80) → 0.344(step100) ✅（涨得很快）
-entropy: 1.53（不塌缩，而且在探索）✅
-grad_norm: 3.38（有有效梯度）✅
-reward_std: 0.26（组内有差异，GRPO 能做相对优化）✅
-group_unique_rate≈0.875（开始有些重复，但还远不到塌缩；而且你有 duplicate penalty 在控）✅
+
+5) 我建议你加一个“诊断日志”，不用改 reward 也能判断方向对不对
+你现在最大的不确定性是：SASRec 在候选内把 GT 排第几？
 
 
+
+
+最新版
+我们将GT作为最高奖励，因为我们的目标是HR@1和HR@10，而不是和SASRec拟合
+因此我们需要修改reward
+我们还在train的代码中加入了evaluate阶段，每100个step，对50个sample进行eval
 

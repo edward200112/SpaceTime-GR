@@ -40,6 +40,9 @@ def _has_incomplete_paren(s: str) -> bool:
 
 
 def extract_first_namecat(completion_text: str) -> Tuple[Optional[str], Optional[str], str, str, bool, bool]:
+    """
+    return: name, cat, first_line, trail, prefix_ok, incomplete
+    """
     t = _to_text(completion_text)
     lines = t.splitlines()
     first = norm_text(lines[0] if lines else t)
@@ -65,6 +68,9 @@ def canon_key(name: str, cat: str) -> str:
 
 
 def parse_namecat_keys(text: str) -> Tuple[str, str, bool]:
+    """
+    返回 canonical key（保留大小写）和 casefold key
+    """
     t = norm_text(text)
     m = NAMECAT_FIND_RE.search(t)
     if not m:
@@ -77,23 +83,21 @@ def parse_namecat_keys(text: str) -> Tuple[str, str, bool]:
 
 @dataclass
 class ResolverConfig:
-    # bonuses
+    # formatting / membership
     format_bonus: float = 0.05
-    in_candidates_bonus: float = 0.10
+    in_candidates_bonus: float = 0.05
 
-    # match
-    match_reward_exact: float = 0.25
-    match_reward_fold: float = 0.03
+    # ✅ HR 主目标：选中 GT 才高回报
+    correct_reward: float = 2.0          # chosen == GT
+    wrong_penalty: float = 0.3           # chosen in candidates but != GT
+    unknown_penalty: float = 0.6         # not in candidates (or cannot parse)
+    rank_shaping_weight: float = 0.2     # wrong 时：按 teacher-rank 距离 GT 给 0..w 的 shaping
 
-    # teacher shaping
-    alpha: float = 0.6
-    softmax_temp: float = 1.0
-    teacher_mode: str = "zscore"  # zscore/logprob/prob/rank
-    teacher_clip: float = 5.0
+    # teacher
+    softmax_temp: float = 1.0            # 仅用于 SASRec predict 的温度（不一定要用，但保留）
 
     # penalties
     extra_text_penalty: float = 0.05
-    unknown_penalty: float = 0.10
     prefix_penalty: float = 0.05
     incomplete_penalty: float = 0.10
     copy_penalty: float = 0.08
@@ -118,32 +122,19 @@ class SasrecScorer:
             return torch.zeros(len(candidate_ids), device=self.device)
         hist = torch.tensor(history, dtype=torch.long, device=self.device).unsqueeze(0)
         cand = torch.tensor(candidate_ids, dtype=torch.long, device=self.device).unsqueeze(0)
-        scores = self.sasrec.predict_candidates(hist, cand).squeeze(0)
+        scores = self.sasrec.predict_candidates(hist, cand).squeeze(0)  # [K]
         return scores
 
 
-def _teacher_reward_from_scores(scores: torch.Tensor, chosen_idx: int, mode: str, temp: float) -> float:
-    if scores.numel() == 0 or chosen_idx < 0 or chosen_idx >= scores.numel():
-        return 0.0
-
-    s = scores.float()
-    if mode == "prob":
-        p = torch.softmax(s / float(temp), dim=0)
-        return float((p[chosen_idx] - p.mean()).item())
-    if mode == "logprob":
-        lp = torch.log_softmax(s / float(temp), dim=0)
-        return float((lp[chosen_idx] - lp.mean()).item())
-    if mode == "rank":
-        order = torch.argsort(s, descending=True)
-        rank = (order == int(chosen_idx)).nonzero(as_tuple=False)
-        r = int(rank.item()) if rank.numel() else int(scores.numel() - 1)
-        K = int(scores.numel())
-        return float((float(K - 1 - r) / max(1.0, float(K - 1))) - 0.5)
-
-    mu = s.mean()
-    sd = s.std(unbiased=False) + 1e-6
-    z = (s - mu) / sd
-    return float(z[chosen_idx].item())
+def _rank_positions_desc(scores: torch.Tensor) -> torch.Tensor:
+    """
+    scores: [K]
+    return ranks: [K], best rank = 0
+    """
+    order = torch.argsort(scores, descending=True)
+    ranks = torch.empty_like(order)
+    ranks[order] = torch.arange(order.numel(), device=scores.device)
+    return ranks
 
 
 def make_reward_fn(sasrec_scorer: SasrecScorer, cfg: ResolverConfig):
@@ -151,11 +142,13 @@ def make_reward_fn(sasrec_scorer: SasrecScorer, cfg: ResolverConfig):
 
     def reward_fn(prompts, completions, **kwargs):
         histories: List[List[int]] = kwargs["history_item_ids"]
-        targets_item: List[int] = kwargs["target_item_id"]
         targets_nc: List[str] = kwargs["target_namecat"]
 
         cand_namecats: List[List[str]] = kwargs["candidate_namecats"]
         cand_item_ids: List[List[int]] = kwargs["candidate_item_ids"]
+
+        # ✅ 来自 train_grpo 的字段（你已经打印过 TARGET_POS_HIST，说明有）
+        target_pos_list: List[int] = kwargs["target_pos"]
 
         step = kwargs.get("step", None)
         if step is None:
@@ -174,7 +167,7 @@ def make_reward_fn(sasrec_scorer: SasrecScorer, cfg: ResolverConfig):
             lines = comp_text.splitlines()
             first_line = norm_text(lines[0] if lines else comp_text)
             out_first_lines.append(first_line)
-            name, cat, _, _, _, _ = extract_first_namecat(comp_text)
+            name, cat, *_ = extract_first_namecat(comp_text)
             if name is not None and cat is not None:
                 out_fold_keys.append(canon_key(name, cat).casefold())
             else:
@@ -199,9 +192,11 @@ def make_reward_fn(sasrec_scorer: SasrecScorer, cfg: ResolverConfig):
         # stats
         cnt_prefix_ok = cnt_in_cands = 0
         cnt_in_exact = cnt_in_fold = 0
-        cnt_match_exact = cnt_match_fold = 0
+        cnt_correct = 0
         cnt_unknown = cnt_extra = cnt_incomplete = 0
-        sum_reward = sum_fmt = sum_in = sum_match = sum_teacher = sum_pen = 0.0
+        sum_reward = sum_fmt = sum_in = sum_core = sum_shape = sum_pen = 0.0
+        sum_rankdist = 0.0
+        cnt_rankdist = 0
 
         top_heap = []
         bot_heap = []
@@ -210,8 +205,8 @@ def make_reward_fn(sasrec_scorer: SasrecScorer, cfg: ResolverConfig):
         rewards = []
         dump_recs = []
 
-        for i, (comp, hist, tgt_item, tgt_nc, cands_nc, cands_it) in enumerate(
-            zip(completions, histories, targets_item, targets_nc, cand_namecats, cand_item_ids)
+        for i, (comp, hist, tgt_nc, cands_nc, cands_it, tgt_pos) in enumerate(
+            zip(completions, histories, targets_nc, cand_namecats, cand_item_ids, target_pos_list)
         ):
             comp_text = _to_text(comp)
             lines = comp_text.splitlines()
@@ -222,8 +217,8 @@ def make_reward_fn(sasrec_scorer: SasrecScorer, cfg: ResolverConfig):
 
             r_fmt = float(cfg.format_bonus) if has_namecat else 0.0
             r_in = 0.0
-            r_match = 0.0
-            r_teacher = 0.0
+            r_core = 0.0
+            r_shape = 0.0
             pen = 0.0
 
             if prefix_ok:
@@ -246,11 +241,10 @@ def make_reward_fn(sasrec_scorer: SasrecScorer, cfg: ResolverConfig):
                 pen -= float(cfg.extra_text_penalty)
                 cnt_extra += 1
 
-            tgt_key_exact, tgt_key_fold, tgt_ok = parse_namecat_keys(tgt_nc)
-
             out_key_exact = canon_key(name, cat) if has_namecat else ""
             out_key_fold = out_key_exact.casefold() if out_key_exact else ""
 
+            # candidate maps
             cand_exact2idx: Dict[str, int] = {}
             cand_fold2idx: Dict[str, int] = {}
             cand_ids: List[int] = []
@@ -271,7 +265,7 @@ def make_reward_fn(sasrec_scorer: SasrecScorer, cfg: ResolverConfig):
 
             if not has_namecat:
                 cnt_unknown += 1
-                pen -= float(cfg.unknown_penalty)
+                r_core -= float(cfg.unknown_penalty)
             else:
                 if out_key_exact and out_key_exact in cand_exact2idx:
                     chosen_idx = cand_exact2idx[out_key_exact]
@@ -287,42 +281,47 @@ def make_reward_fn(sasrec_scorer: SasrecScorer, cfg: ResolverConfig):
 
                 if not in_candidates or chosen_idx is None:
                     cnt_unknown += 1
-                    pen -= float(cfg.unknown_penalty)
+                    r_core -= float(cfg.unknown_penalty)
                 else:
                     cnt_in_cands += 1
                     r_in = float(cfg.in_candidates_bonus)
 
-                    is_tgt_exact = (tgt_ok and out_key_exact and out_key_exact == tgt_key_exact)
-                    is_tgt_fold = (tgt_ok and out_key_fold and out_key_fold == tgt_key_fold)
+                    # ✅ HR 主目标：选中 target_pos 才算对
+                    correct = (int(chosen_idx) == int(tgt_pos))
+                    if correct:
+                        cnt_correct += 1
+                        r_core += float(cfg.correct_reward)
+                        # correct 时可不给 shaping（也行给一点常数；这里给 0）
+                    else:
+                        r_core -= float(cfg.wrong_penalty)
 
-                    if is_tgt_exact:
-                        r_match = float(cfg.match_reward_exact)
-                        cnt_match_exact += 1
-                    elif is_tgt_fold:
-                        r_match = float(cfg.match_reward_fold)
-                        cnt_match_fold += 1
-                        pen -= float(cfg.copy_penalty)
+                        # ✅ teacher shaping：按 teacher-rank 距离 GT 给 0..w（越近越高）
+                        if float(cfg.rank_shaping_weight) > 0 and cand_ids:
+                            scores = sasrec_scorer.score_candidates(hist, cand_ids) / float(cfg.softmax_temp)
+                            ranks = _rank_positions_desc(scores)  # best=0
+                            rg = int(ranks[int(tgt_pos)].item()) if 0 <= int(tgt_pos) < ranks.numel() else ranks.numel() - 1
+                            rc = int(ranks[int(chosen_idx)].item())
+                            K = int(ranks.numel())
+                            dist = abs(rc - rg) / max(1, K - 1)  # 0..1
+                            # shaping: 近 => 接近 w；远 => 0
+                            r_shape += float(cfg.rank_shaping_weight) * float(1.0 - dist)
 
-                    if float(cfg.alpha) > 0 and cand_ids:
-                        scores = sasrec_scorer.score_candidates(hist, cand_ids)
-                        tr = _teacher_reward_from_scores(scores, int(chosen_idx), cfg.teacher_mode, float(cfg.softmax_temp))
-                        clip = float(cfg.teacher_clip)
-                        if clip > 0:
-                            tr = max(-clip, min(clip, tr))
-                        r_teacher = float(tr)
+                            sum_rankdist += float(dist)
+                            cnt_rankdist += 1
 
+            # duplicate penalty inside group
             dup_cnt = int(dup_count_map.get(i, 1))
             if dup_cnt > 1:
                 pen -= float(cfg.duplicate_penalty) * float(dup_cnt - 1)
 
-            r = r_fmt + r_in + r_match + float(cfg.alpha) * r_teacher + pen
+            r = r_fmt + r_in + r_core + r_shape + pen
             rewards.append(float(r))
 
             sum_reward += float(r)
             sum_fmt += float(r_fmt)
             sum_in += float(r_in)
-            sum_match += float(r_match)
-            sum_teacher += float(r_teacher)
+            sum_core += float(r_core)
+            sum_shape += float(r_shape)
             sum_pen += float(pen)
 
             rec = {
@@ -333,14 +332,13 @@ def make_reward_fn(sasrec_scorer: SasrecScorer, cfg: ResolverConfig):
                 "out": out_key_exact,
                 "out_fold": out_key_fold,
                 "tgt": tgt_nc,
-                "tgt_exact": tgt_key_exact,
-                "tgt_fold": tgt_key_fold,
-                "tgt_item": int(tgt_item),
+                "tgt_pos": int(tgt_pos),
+                "chosen_idx": int(chosen_idx) if chosen_idx is not None else -1,
+                "correct": bool(chosen_idx is not None and int(chosen_idx) == int(tgt_pos)),
                 "fmt": float(r_fmt),
                 "in": float(r_in),
-                "match": float(r_match),
-                "teacher": float(r_teacher),
-                "alpha": float(cfg.alpha),
+                "core": float(r_core),
+                "shape": float(r_shape),
                 "pen": float(pen),
                 "in_candidates": bool(in_candidates),
                 "prefix_ok": bool(prefix_ok),
@@ -379,6 +377,7 @@ def make_reward_fn(sasrec_scorer: SasrecScorer, cfg: ResolverConfig):
 
                 def d(a, b): return a / b if b else 0.0
                 mean_unique = sum(unique_rate_map.values()) / max(1, len(unique_rate_map))
+                mean_rankdist = (sum_rankdist / cnt_rankdist) if cnt_rankdist else 0.0
 
                 print("=" * 90)
                 print(f"[DEBUG reward] step={step} n={n}")
@@ -386,19 +385,19 @@ def make_reward_fn(sasrec_scorer: SasrecScorer, cfg: ResolverConfig):
                     f"  prefix_ok_rate={d(cnt_prefix_ok,n):.3f} "
                     f"in_candidates_rate={d(cnt_in_cands,n):.3f} "
                     f"(exact_in={cnt_in_exact}, fold_in={cnt_in_fold}) "
-                    f"match_exact_rate={d(cnt_match_exact,n):.3f} "
-                    f"match_fold_rate={d(cnt_match_fold,n):.3f} "
+                    f"correct_rate={d(cnt_correct,n):.3f} "
                     f"unknown_rate={d(cnt_unknown,n):.3f} "
                     f"extra_text_rate={d(cnt_extra,n):.3f} "
                     f"incomplete_rate={d(cnt_incomplete,n):.3f} "
-                    f"group_unique_rate≈{mean_unique:.3f}"
+                    f"group_unique_rate≈{mean_unique:.3f} "
+                    f"mean_rankdist(wrong_only)≈{mean_rankdist:.3f}"
                 )
                 print(
                     f"  mean_reward={d(sum_reward,n):.4f} "
                     f"mean_fmt={d(sum_fmt,n):.4f} "
                     f"mean_in={d(sum_in,n):.4f} "
-                    f"mean_match={d(sum_match,n):.4f} "
-                    f"mean_teacher={d(sum_teacher,n):.4f} "
+                    f"mean_core={d(sum_core,n):.4f} "
+                    f"mean_shape={d(sum_shape,n):.4f} "
                     f"mean_penalty={d(sum_pen,n):.4f}"
                 )
 
@@ -409,20 +408,22 @@ def make_reward_fn(sasrec_scorer: SasrecScorer, cfg: ResolverConfig):
                 for rr, _, rec in top_sorted:
                     print(
                         f"    r={rec['reward']:.4f} via={rec['via']} inCand={int(rec['in_candidates'])} "
-                        f"dup={rec['dup_cnt']} first='{rec['first'][:80]}' trail='{rec['trail'][:40]}' "
-                        f"out='{rec['out'][:60]}' tgt='{str(rec['tgt'])[:60]}' "
-                        f"(fmt={rec['fmt']:.2f}, in={rec['in']:.2f}, match={rec['match']:.2f}, "
-                        f"teacher={rec['teacher']:.3f}*a{rec['alpha']:.2f}, pen={rec['pen']:.2f})"
+                        f"correct={int(rec['correct'])} dup={rec['dup_cnt']} "
+                        f"chosen={rec['chosen_idx']} tgtpos={rec['tgt_pos']} "
+                        f"first='{rec['first'][:80]}' "
+                        f"(fmt={rec['fmt']:.2f}, in={rec['in']:.2f}, core={rec['core']:.2f}, "
+                        f"shape={rec['shape']:.2f}, pen={rec['pen']:.2f})"
                     )
 
                 print("\n  [BOTTOM examples]")
                 for neg_rr, _, rec in bot_sorted:
                     print(
                         f"    r={rec['reward']:.4f} via={rec['via']} inCand={int(rec['in_candidates'])} "
-                        f"dup={rec['dup_cnt']} first='{rec['first'][:80]}' trail='{rec['trail'][:40]}' "
-                        f"out='{rec['out'][:60]}' tgt='{str(rec['tgt'])[:60]}' "
-                        f"(fmt={rec['fmt']:.2f}, in={rec['in']:.2f}, match={rec['match']:.2f}, "
-                        f"teacher={rec['teacher']:.3f}*a{rec['alpha']:.2f}, pen={rec['pen']:.2f})"
+                        f"correct={int(rec['correct'])} dup={rec['dup_cnt']} "
+                        f"chosen={rec['chosen_idx']} tgtpos={rec['tgt_pos']} "
+                        f"first='{rec['first'][:80]}' "
+                        f"(fmt={rec['fmt']:.2f}, in={rec['in']:.2f}, core={rec['core']:.2f}, "
+                        f"shape={rec['shape']:.2f}, pen={rec['pen']:.2f})"
                     )
                 print("=" * 90)
 
