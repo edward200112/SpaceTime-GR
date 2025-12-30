@@ -415,3 +415,21 @@ python HardMiningGRPO/sanity_phase2.py \
   --max_new_tokens 8 \
   --temperature 0.9 \
   --device cuda
+
+
+
+新的build topk
+python HardMiningGRPO/build_teacher_topk.py \
+  --input_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_train.cand.fixed_precise_v2.jsonl \
+  --output_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl \
+  --overwrite \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --topk 200 \
+  --scan_topk 1000 \
+  --pool_mode head_near \
+  --head_k 80 --near_above_k 60 --near_below_k 59 \
+  --filter_history \
+  --batch_size 2048 --chunk_size 50000 \
+  --item_emb_on_gpu \
+  --score_dtype fp16
