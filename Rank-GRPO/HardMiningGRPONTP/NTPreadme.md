@@ -261,7 +261,7 @@ check_teacher_alignment.py：
 python HardMiningGRPO/check_teacher_alignment.py \
   --jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.cand.fixed_precise_v2.jsonl \
   --sasrec_pkl /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
-  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec_Cont/sasrec_best.pth \
   --max_samples 5000 \
   --num_neg 199 \
   --batch_size 512 \
@@ -283,7 +283,7 @@ python HardMiningGRPO/check_teacher_alignment.py \
 python HardMiningGRPO/diagnose_teacher_fullcorpus.py \
   --jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.cand.fixed_precise_v2.jsonl \
   --sasrec_pkl /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
-  --sasrec_ckpt /workspace/Rank-GRPO/SASRec_Data_new/sasrec_full_latest.pth \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_best.pth \
   --sample_n 5000 \
   --batch_size 256 \
   --chunk_size 50000 \
@@ -301,3 +301,117 @@ python HardMiningGRPO/diagnose_teacher_fullcorpus.py \
 
 
 
+使用正确的Teacher Model
+
+phase1：
+
+python HardMiningGRPO/train_grpo_ntp.py \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
+  --train_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.cand.fixed_precise_v2.jsonl \
+  --eval_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_val.cand.fixed_precise_v2.jsonl \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --output_dir  ./HardMiningGRPO/ckpt_grpo_ntp_phase1_teacherSASRec \
+  --phase 1 \
+  --use_chat_template \
+  --strip_candidates_from_prompt \
+  --sasrec_embed_dim 128 --sasrec_num_blocks 2 --sasrec_num_heads 2 --sasrec_dropout 0.2 --sasrec_max_len 50 \
+  --per_device_bs 16 --grad_accum 2 --lr 5e-6 \
+  --num_generations 8 --temperature 0.9 \
+  --save_steps 500 --logging_steps 50 --num_train_epochs 1
+
+生成 Phase2 train 数据
+python HardMiningGRPO/build_teacher_topk.py \
+  --input_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_train.cand.fixed_precise_v2.jsonl \
+  --output_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl \
+  --overwrite \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --topk 200 \
+  --pool_mode head_near \
+  --head_k 80 --near_above_k 60 --near_below_k 59 \
+  --filter_history \
+  --batch_size 2048 --chunk_size 50000 \
+  --item_emb_on_gpu \
+  --score_dtype fp16
+
+
+生成 Phase2 val 数据
+python HardMiningGRPO/build_teacher_topk.py \
+  --input_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_val.cand.fixed_precise_v2.jsonl \
+  --output_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_val.phase2.teacher200.headnear.jsonl \
+  --overwrite \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --topk 200 \
+  --pool_mode head_near \
+  --head_k 80 --near_above_k 60 --near_below_k 59 \
+  --filter_history \
+  --batch_size 2048 --chunk_size 50000 \
+  --item_emb_on_gpu \
+  --score_dtype fp16
+
+
+Phase2 训练命令
+python HardMiningGRPO/train_grpo_ntp.py \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningGRPO/ckpt_grpo_ntp_phase1_teacherSASRec \
+  --train_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl \
+  --eval_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_val.phase2.teacher200.headnear.jsonl \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --output_dir  ./HardMiningGRPO/ckpt_grpo_ntp_phase2_teacherSASRec \
+  --phase 2 \
+  --use_chat_template \
+  --strip_candidates_from_prompt \
+  --teacher_pool_k 200 \
+  --sasrec_embed_dim 128 --sasrec_num_blocks 2 --sasrec_num_heads 2 --sasrec_dropout 0.2 --sasrec_max_len 50 \
+  --rank_shaping_weight 0.2 --alpha 0.6 --teacher_clip 5.0 \
+  --per_device_bs 16 --grad_accum 2 --lr 5e-6 \
+  --num_generations 8 --temperature 0.9 \
+  --save_steps 500 --logging_steps 50 --num_train_epochs 1
+
+最关键的注意点（不做会直接“效果差/不收敛”）：
+
+Phase2 数据必须包含 teacher_top_item_ids（你已经验证过 OK）
+sasrec_dataset.pkl 里的 n_items 必须和 teacher 的 item embedding 一致（你现在 n_items=992862 是一致的）。
+你现在的 teacher 在“全库 rank”诊断里 HR@200=0.16/HR@1000=0.42（那次结果），但你后来也看到“candidate 内”很高。
+Phase2 的 head_near 模式本质是做一个 更 recall 的 teacher pool，这是对 GRPO 更友好的（比纯全库 top200 更可学）。
+如果你 GPU 显存紧张（LLM + SASRec 同卡），最简单粗暴的方法：把 train_grpo_ntp.py 里这一行改成让 teacher 上 CPU：
+
+
+
+
+
+python HardMiningGRPO/eval_sasrec_fullcorpus_plus_sampled.py \
+  --dataset_path /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --weights_path /workspace/Rank-GRPO/SASRec_Cont/sasrec_full_latest.pth \
+  --max_len 50 --embed_dim 128 --num_blocks 2 --num_heads 2 --dropout 0.2 \
+  --device cuda \
+  --do_full --full_users 5000 --full_bs 256 --chunk_size 50000 --score_dtype fp16 --emb_on_gpu
+
+python HardMiningGRPO/eval_sasrec_fullcorpus_plus_sampled.py \
+  --dataset_path /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --weights_path /workspace/Rank-GRPO/SASRec_Cont/sasrec_full_latest.pth \
+  --max_len 50 --embed_dim 128 --num_blocks 2 --num_heads 2 --dropout 0.2 \
+  --device cuda \
+  --do_fast --fast_users 2000 --fast_neg 99 --fast_bs 256 \
+  --do_strict --strict_users 2000 --strict_neg 99 --strict_bs 128
+
+
+
+
+python HardMiningGRPO/sanity_phase2.py \
+  --jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl \
+  --sasrec_code_dir /workspace/Rank-GRPO/SASRec \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
+  --use_chat_template \
+  --topk 200 \
+  --sample_n 1000 \
+  --max_new_tokens 8 \
+  --temperature 0.9 \
+  --device cuda

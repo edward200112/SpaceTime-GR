@@ -143,29 +143,32 @@ def _get_field(ex: Dict[str, Any], keys, required=True, default=None):
     return default
 
 
+CAND_CUT_RE = re.compile(r"(候选|备选|candidate|candidates|候选poi|poi列表|候选列表)", re.IGNORECASE)
+
 def strip_candidate_block(raw_prompt: str) -> str:
     p = (raw_prompt or "").rstrip()
-    hit_pos = -1
-    for hdr in CAND_HEADERS:
-        pos = p.find(hdr)
-        if pos != -1:
-            hit_pos = pos
-            break
-    if hit_pos != -1:
-        p = p[:hit_pos].rstrip()
+    lines = p.splitlines()
 
-    # 去掉旧“只能从候选…”约束行
-    lines = [ln for ln in p.splitlines() if ln.strip()]
-    new_lines = []
+    cut = None
+    for i, ln in enumerate(lines):
+        if CAND_CUT_RE.search(ln):
+            cut = i
+            break
+
+    if cut is not None:
+        lines = lines[:cut]
+
+    # 再清一次老约束行
+    out = []
     for ln in lines:
-        bad = False
-        for pat in OLD_CONSTRAINT_PATTERNS:
-            if re.match(pat, ln.strip()):
-                bad = True
-                break
-        if not bad:
-            new_lines.append(ln)
-    return "\n".join(new_lines).rstrip()
+        s = ln.strip()
+        if not s:
+            continue
+        if ("只能从" in s and "候选" in s) or ("选 1 个" in s and "候选" in s):
+            continue
+        out.append(ln)
+
+    return "\n".join(out).rstrip()
 
 
 def load_sasrec_from_ckpt(
