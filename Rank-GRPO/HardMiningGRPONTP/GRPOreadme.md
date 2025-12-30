@@ -642,26 +642,3 @@ watch -n 1 nvidia-smi
 
 
 
-# 转回NTP任务
-把候选从“显式约束/输出空间”降级为“训练时的 teacher 软池子（reward shaping 用）”，最终 prompt 不再出现候选；
-同时 reward 需要从“候选 membership reward”改成“全库实体解析 + 命中 GT + teacher 软引导”。
-
-
-方案 A（推荐，工程最稳）：输出 gmap_id（或 item_id）作为主输出
-训练/评估都清晰，避免 同名同类地点冲突（Name(Cat) 在全库一定会撞）。
-推理时再用 id 查 meta 输出 Name(Cat)。
-格式例：
-0x123abc... 或 992862（你的 item_id）
-
-
-最推荐的“训练日程”（避免一下子信号稀疏崩掉）：
-
-Phase 1：Prompt 去候选，但 reward 仍用 K=50 作为 teacher-pool（密集信号）
-  prompt_with_candidates=False
-  reward：exists/hit 为主，teacher shaping 用 candidate pool
-  这一步能让模型学会“没候选也能猜你要去哪里”，但训练仍稳定
-Phase 2：把 teacher-pool 扩大（更像 recall）
-  预计算每条样本的 teacher_top_item_ids（SASRec 全库 top200）
-  reward shaping 从 K=50 切到 top200
-Phase 3（可选）：输出从 Name(Cat) 切换到 item_id（彻底消除歧义）
-  你可以先 SFT 一轮让格式切过去，再 GRPO

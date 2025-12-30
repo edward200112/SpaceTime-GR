@@ -7,6 +7,21 @@ python TeacherModel/check_hard_negative_quality.py   --sample_n 50000 --batch_si
 python ./TeacherModel/train_sasrec.py  --dataset_path ./SASRec_Data/sasrec_dataset.pkl    --output_dir ./SASRec_Data    --batch_size 4096     --lr 1e-4    --num_epochs 50    --num_negs 4    --pop_alpha 0.75    --do_eval    --eval_every 1    --eval_users 5000  --eval_neg 199    --eval_batch_size 256  --pin_memory --num_workers 14
 
 
+python TeacherModel/train_sasrec.py \
+  --dataset_path /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --output_dir /workspace/Rank-GRPO/SASRec_Data \
+  --resume_path /workspace/Rank-GRPO/SASRec_Data/sasrec_full_latest.pt \
+  --batch_size 4096 \
+  --lr 5e-5 \
+  --num_epochs 20 \
+  --num_negs 6 \
+  --pop_alpha 0.75 \
+  --do_fast_eval --fast_eval_every 10 --fast_eval_users 2000 --fast_eval_neg 99 --fast_eval_batch_size 512 --fast_eval_fixed_users \
+  --do_strict_eval --strict_eval_every 20 --strict_eval_users 2000 --strict_eval_neg 99 --strict_eval_batch_size 512 \
+  --early_stop --early_stop_metric NDCG@10 --early_stop_patience 5 --early_stop_min_delta 0.002 \
+  --pin_memory --num_workers 14
+
+
 
 python TeacherModel/calc_density_from_sasrec_pkl.py --pkl ./SASRec_Data/sasrec_dataset.pkl 
 
@@ -51,3 +66,20 @@ for i, (k, v) in enumerate(data.items()):
     if i >= 4:
         break
 PY
+
+
+
+
+python /workspace/Rank-GRPO/TeacherModel/train_sasrec.py \
+  --dataset_path /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --output_dir   /workspace/Rank-GRPO/SASRec_Cont \
+  --resume_path  /workspace/Rank-GRPO/SASRec_Cont/seed.pth \
+  --batch_size 4096 \
+  --lr 1e-4 \
+  --num_epochs 300 \
+  --num_negs 4 --pop_alpha 0.75 \
+  --do_fast_eval --fast_eval_every 20 --fast_eval_users 2000 --fast_eval_neg 99 --fast_eval_batch_size 512 \
+  --save_every 5 --save_best \
+  --early_stop --early_stop_metric NDCG@10 --early_stop_patience 5 --early_stop_min_delta 0.001 \
+  --pin_memory --num_workers 14
+
