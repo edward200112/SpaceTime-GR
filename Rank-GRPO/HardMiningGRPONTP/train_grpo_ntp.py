@@ -26,7 +26,8 @@ from HardMiningGRPO.reward_ntp_phase2_recall import ResolverConfig as ResolverCo
 USER_PREFIX_TEMPLATE = "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
 # NTP rule: output item_id only
-RULE_FALLBACK = "只输出一个 item_id（整数），不要解释，也不要输出其他文字。"
+RULE_FALLBACK = "只输出一个 item_id（纯数字），例如：12345。不要输出地点名、不要输出括号或任何解释。"
+
 
 # 用于从旧 prompt 中切掉候选段（你原数据 prompt 末尾大概率有候选列表）
 CAND_HEADER_CANON = "候选地点（只能从下列候选中选 1 个，并原样输出；不要输出其他文字）："
@@ -43,6 +44,9 @@ OLD_CONSTRAINT_PATTERNS = [
     r".*只能从.*候选.*",
     r".*候选.*选\s*1\s*个.*",
     r".*in\s*candidates.*",
+    # ✅ 新增：去掉旧的“输出地点名”约束，避免和 item_id 规则打架
+    r".*只输出一个地点名.*",
+    r".*只输出一个地点.*",
 ]
 
 
@@ -145,30 +149,110 @@ def _get_field(ex: Dict[str, Any], keys, required=True, default=None):
 
 CAND_CUT_RE = re.compile(r"(候选|备选|candidate|candidates|候选poi|poi列表|候选列表)", re.IGNORECASE)
 
+# 把这些“输出地点名”旧规则干掉
+OLD_RULE_RE = re.compile(r"(只输出一个地点名|只输出一个地点|只输出一个POI|只输出一个地点名\(类别\))")
+# ====== 必须去掉的旧约束（含 place-name rule） ======
+OLD_CONSTRAINT_PATTERNS = [
+    r".*只能从.*候选.*",
+    r".*候选.*选\s*1\s*个.*",
+    r".*in\s*candidates.*",
+    r".*只输出一个地点名.*",
+    r".*只输出一个地点.*",
+    r".*不要解释.*",
+]
+RULE_FALLBACK = "只输出一个 item_id（纯数字），例如：12345。不要输出地点名、不要输出括号或任何解释。"
 def strip_candidate_block(raw_prompt: str) -> str:
     p = (raw_prompt or "").rstrip()
     lines = p.splitlines()
 
+    # cut at first candidate header-ish line
     cut = None
     for i, ln in enumerate(lines):
         if CAND_CUT_RE.search(ln):
             cut = i
             break
-
     if cut is not None:
         lines = lines[:cut]
 
-    # 再清一次老约束行
+    # remove old constraint lines
     out = []
     for ln in lines:
         s = ln.strip()
         if not s:
             continue
-        if ("只能从" in s and "候选" in s) or ("选 1 个" in s and "候选" in s):
-            continue
-        out.append(ln)
-
+        bad = False
+        for pat in OLD_CONSTRAINT_PATTERNS:
+            if re.match(pat, s):
+                bad = True
+                break
+        if not bad:
+            out.append(ln)
     return "\n".join(out).rstrip()
+
+def strip_prompt_to_history_only(raw_prompt: str) -> str:
+    """
+    把原 prompt 裁成「只剩任务描述+历史」：
+    - 切掉候选块（从出现候选关键词那一行开始全部删掉）
+    - 删除旧的约束行（含：只输出地点名/只能从候选/不要解释 等）
+    """
+    p = (raw_prompt or "").rstrip()
+    lines = p.splitlines()
+
+    # 1) 切掉候选块
+    cut = None
+    for i, ln in enumerate(lines):
+        if CAND_CUT_RE.search(ln):
+            cut = i
+            break
+    if cut is not None:
+        lines = lines[:cut]
+
+    # 2) 删除旧规则行
+    out = []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        bad = False
+        for pat in OLD_CONSTRAINT_PATTERNS:
+            if re.match(pat, s):
+                bad = True
+                break
+        if not bad:
+            out.append(ln)
+    return "\n".join(out).rstrip()
+def build_candidate_block(cand_ids: List[int], cand_namecats: List[str], max_k: int = 50) -> str:
+    """
+    Phase1 用：把候选写回 prompt，且让每行以“纯数字 id 开头”，避免模型学会输出 '123.' 这种。
+    推荐格式： `12345 <space> Name (cat)`
+    """
+    cand_ids = [int(x) for x in (cand_ids or [])][:max_k]
+    cand_namecats = list(cand_namecats or [])[:max_k]
+
+    lines = ["候选地点（只能从下列候选中选 1 个；只输出对应 item_id 纯数字，不要解释）："]
+    for cid, namecat in zip(cand_ids, cand_namecats):
+        namecat = (namecat or "").strip()
+        # 用空格分隔，不用 "id."，降低模型输出带点的概率
+        lines.append(f"{cid} {namecat}")
+    return "\n".join(lines)
+
+
+
+
+
+def render_candidates_with_ids(candidate_item_ids, candidate_namecats) -> str:
+    # candidate_namecats: ["Del Taco (Fast food restaurant)", ...]
+    # candidate_item_ids : [827821, ...]
+    lines = ["候选地点（只能从下列候选中选 1 个；只输出对应 item_id 纯数字，不要解释）："]
+    for cid, namecat in zip(candidate_item_ids, candidate_namecats):
+        try:
+            cid = int(cid)
+        except Exception:
+            continue
+        lines.append(f"{cid}. {str(namecat).strip()}")
+    return "\n".join(lines)
+
+
 
 
 def load_sasrec_from_ckpt(
@@ -275,40 +359,56 @@ def main():
     eval_ds = load_dataset("json", data_files=args.eval_jsonl, split="train")
 
     def format_ex(ex: Dict[str, Any], idx: int) -> Dict[str, Any]:
-        raw = _get_field(ex, ["prompt"])
-        raw = (raw or "").rstrip()
+        # ---- 取原始 prompt（注意：raw prompt 里 place-rule 可能为 True，这是正常的） ----
+        raw_prompt = _get_field(ex, ["prompt"])
+        raw_prompt = (raw_prompt or "").rstrip()
 
-        if args.strip_candidates_from_prompt:
-            raw = strip_candidate_block(raw)
+        # ---- 裁成“任务+历史”，去掉旧规则/旧候选块 ----
+        base = strip_prompt_to_history_only(raw_prompt)
 
-        # append NTP rule
-        if "只输出一个 item_id" not in raw:
-            raw = (raw + "\n" + RULE_FALLBACK).rstrip()
-
-        # fields
+        # ---- fields ----
         hist = _get_field(ex, ["history_item_ids"])
         tgt_id = int(_get_field(ex, ["target_item_id"]))
 
-        cand_ids = _get_field(ex, ["candidate_item_ids", "candidates_item_ids", "candidates_ids"], required=False, default=[])
-        if cand_ids is None:
-            cand_ids = []
+        cand_ids = _get_field(
+            ex,
+            ["candidate_item_ids", "candidates_item_ids", "candidates_ids"],
+            required=False,
+            default=[]
+        ) or []
         cand_ids = [int(x) for x in cand_ids] if isinstance(cand_ids, list) else []
 
-        teacher_top = _get_field(ex, ["teacher_top_item_ids"], required=False, default=[])
-        if teacher_top is None:
-            teacher_top = []
+        cand_namecats = _get_field(
+            ex,
+            ["candidate_namecats"],
+            required=False,
+            default=[]
+        ) or []
+        cand_namecats = [str(x) for x in cand_namecats] if isinstance(cand_namecats, list) else []
+
+        teacher_top = _get_field(ex, ["teacher_top_item_ids"], required=False, default=[]) or []
         teacher_top = [int(x) for x in teacher_top] if isinstance(teacher_top, list) else []
 
-        prompt = build_chat_prompt(tok, raw) if args.use_chat_template else raw
+        # ---- Phase 分流重建 prompt ----
+        if int(args.phase) == 1:
+            # Phase1：保留候选（但用 structured fields 重建成 “id + namecat”）
+            cand_block = build_candidate_block(cand_ids, cand_namecats, max_k=50)
+            final_raw = (base + "\n" + cand_block + "\n" + RULE_FALLBACK).rstrip()
+        else:
+            # Phase2/3：不需要候选块（你用 teacher_top_item_ids shaping）
+            final_raw = (base + "\n" + RULE_FALLBACK).rstrip()
+
+        prompt = build_chat_prompt(tok, final_raw) if args.use_chat_template else final_raw
 
         return {
             "prompt": prompt,
-            "prompt_raw": raw,
+            "prompt_raw": final_raw,
             "history_item_ids": hist,
             "target_item_id": tgt_id,
             "candidate_item_ids": cand_ids,         # Phase1 shaping 用
-            "teacher_top_item_ids": teacher_top,     # Phase2 shaping 用（可为空）
+            "teacher_top_item_ids": teacher_top,     # Phase2 shaping 用
         }
+
 
     num_proc = max(1, (os.cpu_count() or 8) // 2)
     train_ds = train_ds.map(format_ex, with_indices=True, remove_columns=train_ds.column_names, num_proc=num_proc)

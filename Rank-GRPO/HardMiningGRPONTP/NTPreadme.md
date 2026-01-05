@@ -418,7 +418,18 @@ python HardMiningGRPO/sanity_phase2.py \
 
 
 
-新的build topk
+
+
+我现在有一个疑问，在数据量较大的情况下，如果教师模型本身表现就不是很好的情况下（因为几乎所有模型都表现一般）
+那么，被Train的模型，能够超过Teacher模型吗？
+
+
+
+生成新的数据
+# 方案 A 的关键就两点：
+扫描时保留更长的全库 top 列表（scan_topk，比如 1000）
+最终输出仍然是 topk=200，但补齐/去重必须从 scan_topk 的真实列表里补（绝不再用 1）
+
 python HardMiningGRPO/build_teacher_topk.py \
   --input_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_train.cand.fixed_precise_v2.jsonl \
   --output_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl \
@@ -433,3 +444,417 @@ python HardMiningGRPO/build_teacher_topk.py \
   --batch_size 2048 --chunk_size 50000 \
   --item_emb_on_gpu \
   --score_dtype fp16
+
+
+python HardMiningGRPO/build_teacher_topk.py \
+  --input_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_val.cand.fixed_precise_v2.jsonl \
+  --output_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_val.phase2.teacher200.headnear.jsonl \
+  --overwrite \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --topk 200 \
+  --scan_topk 1000 \
+  --pool_mode head_near \
+  --head_k 80 --near_above_k 60 --near_below_k 59 \
+  --filter_history \
+  --batch_size 2048 --chunk_size 50000 \
+  --item_emb_on_gpu \
+  --score_dtype fp16
+
+
+
+
+“phase2 数据 sanity/verify”
+train数据sanity
+
+python HardMiningGRPO/sanity_phase2.py \
+  --jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl \
+  --sasrec_code_dir /workspace/Rank-GRPO/SASRec \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
+  --use_chat_template \
+  --topk 200 \
+  --sample_n 1000 \
+  --max_new_tokens 8 \
+  --temperature 0.9 \
+  --device cuda
+
+
+  eval数据sanity
+  python HardMiningGRPO/sanity_phase2.py \
+  --jsonl ./HardMiningGRPO/grpo_data_v2/grpo_val.phase2.teacher200.headnear.jsonl \
+  --sasrec_code_dir /workspace/Rank-GRPO/SASRec \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
+  --use_chat_template \
+  --topk 200 \
+  --sample_n 1000 \
+  --max_new_tokens 8 \
+  --temperature 0.9 \
+  --device cuda
+
+
+
+  train_grpo_ntp.py新增约束
+  # ✅ OLD_CONSTRAINT_PATTERNS 新增：去掉旧的“输出地点名”约束，避免和 item_id 规则打架
+    r".*只输出一个地点名.*",
+    r".*只输出一个地点.*",
+
+  
+
+  新的训练指令
+  python HardMiningGRPO/train_grpo_ntp.py \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningGRPO/ckpt_grpo_ntp_phase1_teacherSASRec \
+  --train_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl \
+  --eval_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_val.phase2.teacher200.headnear.jsonl \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --output_dir  ./HardMiningGRPO/ckpt_phase2_headnear \
+  --phase 2 \
+  --max_new_tokens 6 \
+  --num_generations 8 \
+  --per_device_bs 16 --grad_accum 2 \
+  --lr 5e-6 \
+  --logging_steps 50 --save_steps 500 \
+  --num_train_epochs 1
+
+
+
+python ./HardMiningGRPO/sanity_phase2.py \
+  --jsonl   grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl \
+  --sasrec_code_dir /workspace/Rank-GRPO/SASRec \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --sample_n 1000 \
+  --topk 200 \
+  --device cuda \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
+  --strip_candidates_from_prompt \
+  --max_new_tokens 8 \
+  --temperature 0.9 \
+  --do_sample
+
+Teacher / Phase2 数据：已经合格（甚至比之前健康很多）
+Phase2 policy：格式已经基本学会，但“选池”完全没学到
+最可能的根因（高概率命中）：你 sanity 跑的时候把候选块 strip 掉了
+
+
+用确定性生成 + 不 strip 候选 重跑一遍：
+python ./HardMiningGRPO/sanity_phase2.py \
+  --jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl \
+  --sasrec_code_dir /workspace/Rank-GRPO/SASRec \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --sample_n 1000 \
+  --topk 200 \
+  --device cuda \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
+  --strip_candidates_from_prompt \
+  --do_sample \
+  --no-do_sample \
+  --max_new_tokens 8 \
+  --use_chat_template \
+  --no-strip_candidates_from_prompt
+
+
+
+
+
+Phase1 训练命令（用 candidate pool，先把“输出纯数字”训出来）
+python HardMiningGRPO/train_grpo_ntp.py \
+  --phase 1 \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
+  --train_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.cand.fixed_precise_v2.jsonl \
+  --eval_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_val.cand.fixed_precise_v2.jsonl \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --output_dir  ./HardMiningGRPO/ckpt_grpo_phase1_itemid \
+  --use_chat_template \
+  --strip_candidates_from_prompt \
+  --num_generations 8 \
+  --temperature 0.7 \
+  --max_new_tokens 8 \
+  --logging_steps 50 \
+  --save_steps 500 \
+  --debug_log_every_steps 200
+
+
+Phase2 开跑（用你已经做好的 teacher200.headnear）
+hase1 出来的 adapter（比如 ckpt_grpo_phase1_itemid/checkpoint-xxxx）作为 Phase2 的 --adapter：
+
+python HardMiningGRPO/train_grpo_ntp.py \
+  --phase 2 \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningGRPO/ckpt_grpo_phase1_itemid/checkpoint-XXXX \
+  --train_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl \
+  --eval_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_val.phase2.teacher200.headnear.jsonl \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --output_dir  ./HardMiningGRPO/ckpt_grpo_phase2_recall \
+  --use_chat_template \
+  --strip_candidates_from_prompt \
+  --num_generations 8 \
+  --temperature 0.7 \
+  --max_new_tokens 8
+
+
+
+
+python ./HardMiningGRPO/sanity_phase2.py \
+  --jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl \
+  --sasrec_code_dir /workspace/Rank-GRPO/SASRec \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --sample_n 1000 --topk 200 --device cuda \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
+  --strip_candidates_from_prompt \
+  --use_chat_template \
+  --no-do_sample \
+  --max_new_tokens 8
+
+
+
+  python ./HardMiningGRPO/train_grpo_phase1_idx.py \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
+  --train_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.cand.fixed_precise_v2.jsonl \
+  --eval_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_val.cand.fixed_precise_v2.jsonl \
+  --sasrec_code_dir /workspace/Rank-GRPO/SASRec \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --output_dir ./HardMiningGRPO/grpo_ckpt_phase1_idx \
+  --use_chat_template \
+  --max_new_tokens 3 \
+  --num_generations 8 \
+  --temperature 0.9
+
+
+在 GRPO 里通常意味着：同一个 prompt 的多次 generation 产物高度一致（甚至完全一样），因为在POI推荐中，长尾问题极其严重，头部强度影响很大，并且肯定存在重复的店名
+但是现在的问题：同一个 prompt 的多次 generation 产物高度一致
+和长尾不是同一个问题
+
+====================================================================================================================================================================================================================================================================================================================================================================================================
+
+先检查数据（Phase1 / Phase2 各一套）
+Phase1 数据检查（candidate 版）
+python - <<'PY'
+import json, random, re
+from collections import Counter, defaultdict
+
+p = "./HardMiningGRPO/grpo_data_v2/grpo_train.cand.fixed_precise_v2.jsonl"  # 改成你的 phase1 train
+SAMPLE_N = 2000
+seed = 42
+rng = random.Random(seed)
+
+need = ["prompt","history_item_ids","target_item_id","candidate_item_ids"]
+bad_missing=0
+bad_cand_len=0
+bad_cand_dup=0
+tgt_not_in_cand=0
+tgt_in_hist=0
+has_place_rule=0
+has_cand_block=0
+cand_lens=[]
+hist_lens=[]
+
+def reservoir(path, n):
+    out=[]; seen=0
+    with open(path,'r',encoding='utf-8') as f:
+        for line in f:
+            line=line.strip()
+            if not line: continue
+            ex=json.loads(line)
+            seen += 1
+            if len(out)<n: out.append(ex)
+            else:
+                j=rng.randint(1,seen)
+                if j<=n: out[j-1]=ex
+    return out
+
+samples = reservoir(p, SAMPLE_N)
+
+for ex in samples:
+    if any(k not in ex for k in need):
+        bad_missing += 1
+        continue
+    prompt = ex["prompt"] or ""
+    hist = ex["history_item_ids"] or []
+    tgt = int(ex["target_item_id"])
+    cand = ex["candidate_item_ids"] or []
+
+    hist = [int(x) for x in hist]
+    cand = [int(x) for x in cand]
+
+    hist_lens.append(len(hist))
+    cand_lens.append(len(cand))
+
+    if len(cand) != 50:  # 你的 cand.fixed_precise_v2 看起来是 50
+        bad_cand_len += 1
+    if len(set(cand)) != len(cand):
+        bad_cand_dup += 1
+    if tgt not in set(cand):
+        tgt_not_in_cand += 1
+    if tgt in set(hist):
+        tgt_in_hist += 1
+
+    if "只输出一个地点名" in prompt:
+        has_place_rule += 1
+    if "候选" in prompt:
+        has_cand_block += 1
+
+print("="*90)
+print("[PHASE1 DATA CHECK]")
+print("file:", p)
+print("sampled:", len(samples))
+print("missing_fields:", bad_missing)
+print("candidate_len!=50:", bad_cand_len)
+print("candidate_has_dup_rows:", bad_cand_dup)
+print("target_not_in_candidate:", tgt_not_in_cand)
+print("target_in_history:", tgt_in_hist)
+print("prompt_has_place_rule(只输出一个地点名):", has_place_rule)
+print("prompt_has_candidate_block(contains 候选):", has_cand_block)
+print("cand_len stats:", (min(cand_lens) if cand_lens else None, sum(cand_lens)/len(cand_lens) if cand_lens else None, max(cand_lens) if cand_lens else None))
+print("hist_len stats:", (min(hist_lens) if hist_lens else None, sum(hist_lens)/len(hist_lens) if hist_lens else None, max(hist_lens) if hist_lens else None))
+print("="*90)
+PY
+
+
+Phase2 数据检查（teacher_top_item_ids 版）
+
+python ./HardMiningGRPO/sanity_phase2.py \
+  --jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl \
+  --sasrec_code_dir /workspace/Rank-GRPO/SASRec \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --sample_n 2000 \
+  --topk 200 \
+  --device cuda
+
+
+
+数据检查
+==========================================================================================
+[PHASE1 DATA CHECK]
+file: ./HardMiningGRPO/grpo_data_v2/grpo_train.cand.fixed_precise_v2.jsonl
+sampled: 2000
+missing_fields: 0
+candidate_len!=50: 0
+candidate_has_dup_rows: 0
+target_not_in_candidate: 0
+target_in_history: 24
+prompt_has_place_rule(只输出一个地点名): 2000
+prompt_has_candidate_block(contains 候选): 2000
+cand_len stats: (50, 50.0, 50)
+hist_len stats: (4, 11.436, 20)
+==========================================================================================
+
+
+
+==========================================================================================
+[SANITY RESULT]
+  file          : ./HardMiningGRPO/grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl
+  sampled       : 2000
+  n_items       : 992862
+  topk          : 200
+  device        : cuda
+  elapsed_sec   : 4.58
+------------------------------------------------------------------------------------------
+[DATA CHECK]
+  missing_fields: 0
+  bad_len(topk) : 0
+  pool_dupe_rows: 0
+  zero_found    : 0
+  oob_found     : 0
+  avg_overlap(hist ∩ pool)/K : 0.000060
+------------------------------------------------------------------------------------------
+[TEACHER SIGNAL IN POOL]
+  target_in_pool_rate : 1.0000  (2000/2000)
+  target_rank_in_pool : mean=133.17  median=142  p90=150
+------------------------------------------------------------------------------------------
+==========================================================================================
+
+
+
+
+
+正式跑 Phase1 GRPO（目标：学会输出 item_id）
+当你确认 reward 分解正常后，跑正式 Phase1：
+python HardMiningGRPO/train_grpo_ntp.py \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500 \
+  --train_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.cand.fixed_precise_v2.jsonl \
+  --eval_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_val.cand.fixed_precise_v2.jsonl \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --output_dir  ./grpo_out_phase1 \
+  --phase 1 \
+  --per_device_bs 16 --grad_accum 2 \
+  --num_generations 8 \
+  --lr 5e-6 \
+  --temperature 0.8 \
+  --max_new_tokens 8 \
+  --save_steps 500 --logging_steps 50
+
+
+
+Phase1 什么时候可以停？（非常实用的停机标准）
+用你 sanity_phase2.py 的 policy 部分（或你自己写一个 quick sanity），在 1000 样本上达到：
+strict_parsed_rate >= 0.95
+output_oob_rate <= 0.005
+has_extra_rate <= 0.2（越低越好）
+关键：模型开始稳定输出纯数字 item_id（而不是地点名）
+
+
+
+检查 GRPO Phase2 的 reward，然后进行 Phase2 的 GRPO
+Phase2 reward 体检（小跑 + debug）
+
+Phase2 的 reward 依赖 teacher_top_item_ids，你数据已 OK，所以这里重点看：
+  in_teacher_rate 是否逐渐上升
+  mean_teacher_rank 是否逐渐变小（更靠前）
+  correct_rate 是否开始上升（最终还是要学到 target）
+
+## DEBUG
+python HardMiningGRPO/train_grpo_ntp.py \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./grpo_out_phase1 \
+  --train_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl \
+  --eval_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_val.phase2.teacher200.headnear.jsonl \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --output_dir  ./grpo_out_phase2_debug \
+  --phase 2 \
+  --logging_steps 1 \
+  --save_steps 999999 \
+  --debug_log_every_steps 1 \
+  --debug_num_show 3
+
+## shuffle trian数据后
+python ./HardMiningGRPO/train_grpo_ntp.py   --phase 1   --base_model /workspace/Qwen2_5-1.5B-Instruct   --adapter ./HardMiningSFT/ckpt_stage2_coinweak_from2500/checkpoint-17500   --train_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.cand.fixed_precise_v2.SHUF.jsonl   --eval_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_val.cand.fixed_precise_v2.SHUF.jsonl   --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl   --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth   --output_dir  ./HardMiningGRPO/ckpt_phase1_fixed   --use_chat_template   --temperature 1.0   --num_generations 8   --max_new_tokens 8   --extra_text_penalty 0.2   --duplicate_penalty 0.05   --logging_steps 20   --save_steps 100   --debug_log_every_steps 20   --debug_num_show 3   --debug_dump_jsonl ./debug_reward_p1.jsonl
+
+## 正式跑 Phase2
+python HardMiningGRPO/train_grpo_ntp.py \
+  --base_model /workspace/Qwen2_5-1.5B-Instruct \
+  --adapter ./grpo_out_phase1 \
+  --train_jsonl ./HardMiningGRPO/grpo_data_v2/grpo_train.phase2.teacher200.headnear.jsonl \
+  --eval_jsonl  ./HardMiningGRPO/grpo_data_v2/grpo_val.phase2.teacher200.headnear.jsonl \
+  --sasrec_pkl  /workspace/Rank-GRPO/SASRec_Data/sasrec_dataset.pkl \
+  --sasrec_ckpt /workspace/Rank-GRPO/SASRec/sasrec_full_latest.pth \
+  --output_dir  ./grpo_out_phase2 \
+  --phase 2 \
+  --per_device_bs 16 --grad_accum 2 \
+  --num_generations 8 \
+  --lr 5e-6 \
+  --temperature 0.8 \
+  --max_new_tokens 8 \
+  --save_steps 500 --logging_steps 50
+

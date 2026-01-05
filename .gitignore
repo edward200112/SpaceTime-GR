@@ -51,6 +51,11 @@ data/llm_ckpt/*
 Rank-GRPO/SFT/sft_data/
 processed_data_old/
 runs/
+SASRec_Data_new/
+grpo_data_v1/
+ckpt_grpo_candidates_rerank_v3/
+grpo_data_v2/
+
 # Logs
 logs/
 *.log

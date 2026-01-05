@@ -29,32 +29,27 @@ def _to_text(x: Any) -> str:
                 return str(x[k])
     return str(x)
 
-
-def extract_first_item_id(completion_text: str) -> Tuple[Optional[int], str, str, bool, bool]:
-    """
-    return: item_id, first_line, rest_text, prefix_ok, has_extra
-    prefix_ok: first_line 在数字前不含非空前缀（允许 'id:' 这种会被视为 prefix）
-    """
+FULL_INT_RE = re.compile(r"^\s*(-?\d+)\s*$")
+ID_LINE_RE  = re.compile(r"^\s*(?:id|item_id)\s*[:：]?\s*(-?\d+)\s*$", re.IGNORECASE)
+def extract_first_item_id(completion_text: str):
     t = _to_text(completion_text)
     lines = t.splitlines()
     first = norm_text(lines[0] if lines else t)
     rest = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
 
-    m = ID_FIND_RE.search(first)
-    if not m:
-        return None, first, rest, False, bool(rest)
-
-    prefix = first[:m.start()].strip()
-    prefix_ok = (prefix == "")  # 只要数字前有东西，就算 prefix 污染（更严格）
-    try:
+    m = FULL_INT_RE.match(first)
+    if m:
         item_id = int(m.group(1))
-    except Exception:
-        item_id = None
+        has_extra = bool(rest)
+        return item_id, first, rest, True, has_extra
 
-    # extra: 数字后还有内容 或 多行
-    tail = first[m.end():].strip()
-    has_extra = bool(tail) or bool(rest)
-    return item_id, first, rest, prefix_ok, has_extra
+    m = ID_LINE_RE.match(first)
+    if m:
+        item_id = int(m.group(1))
+        has_extra = bool(rest)
+        return item_id, first, rest, True, has_extra
+
+    return None, first, rest, False, bool(rest)
 
 
 @dataclass
