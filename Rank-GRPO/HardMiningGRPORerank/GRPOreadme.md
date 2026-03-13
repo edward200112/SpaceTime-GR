@@ -23,7 +23,7 @@ python HardMiningSFT/train_grpo_sasrec.py \
   --lr 2e-6 \
   --max_steps 2000 \
   --grad_accum 1 \
-  --save_steps 200 \
+  --save_steps 500 \
   --log_steps 20 \
   --attn_impl flash_attention_2
 
@@ -587,15 +587,15 @@ python HardMiningGRPO/train_grpo.py \
   --match_reward_exact 0.25 --match_reward_fold 0.03 \
   --alpha 0.6 --softmax_temp 1.0 --teacher_mode zscore --teacher_clip 5.0 \
   --copy_penalty 0.08 --duplicate_penalty 0.02 \
-  --extra_text_penalty 0.05 --unknown_penalty 0.10 --prefix_penalty 0.05 --incomplete_penalty 0.10 \
+  --extra_text_penalty 0.05 --unknown_penalty 0.30 --prefix_penalty 0.05 --incomplete_penalty 0.10 \
   --use_chat_template \
-  --debug_log_every_steps 20 --debug_num_show 5 \
+  --debug_log_every_steps 500 --debug_num_show 5 \
   --debug_dump_jsonl ./HardMiningGRPO/ckpt_grpo_candidates_rerank_v3/debug_samples.jsonl \
   --print_target_pos_hist\
-  --eval_steps 10 \
+  --eval_steps 10000 \
   --eval_max_samples 200 \
   --eval_prompt_bs 1 \
-  --eval_score_bs 8 \
+  --eval_score_bs 4 \
   --eval_length_norm
 
 
