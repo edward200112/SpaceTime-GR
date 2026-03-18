@@ -1,2289 +1,448 @@
+# SpaceTime-GR
 
-# HierGR-SeqRec: 层级生成式序列推荐系统
+一个面向下一地点（Next-POI）预测的时空生成式推荐项目，结合层级语义 ID、生成式建模、检索式排序和强化学习优化，基于 Yelp 数据构建完整实验链路。
 
-基于 Yelp 数据集的生成式推荐系统，使用 RQ-VAE + LLM 实现层级语义 ID 生成。
-=======
-# HierGR-SeqRec: Hierarchical Generative Recommendation with Semantic IDs
+## 项目概述
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+这个仓库关注的不是“用户下一次会点击什么”，而是更接近真实线下行为的问题：**用户下一步会去哪里**。
 
-**HierGR-SeqRec** 是一个基于 **层级语义 ID** 和 **生成式推荐** 的深度学习框架，在 Yelp 数据集上实现了端到端的序列推荐系统。核心技术包括 RQ-VAE 量化编码、双塔架构（PinRec-style）、强化学习优化（GRPO）和统一模型对比评估框架。
+为了解决这个问题，项目将 POI 推荐重构为一个生成式任务：先通过 RQ-VAE 将商家压缩为**层级语义 ID**，再使用基于 Qwen 的语言模型根据用户历史行为生成下一个语义 ID，最后将预测出的语义簇展开为具体商家候选集合。
 
+除了主线的生成式推荐路径之外，仓库还保留了并行的 **PinRec / Ultimate** 双塔检索路线，以及独立的 `Rank-GRPO/` 子目录，用于更复杂的排序、教师-学生强化学习和 hard-mining 实验。因此，这不是一个单脚本 demo，而是一个覆盖**数据处理、表征学习、监督训练、强化学习微调、推理、评估、调试与可视化**的端到端研究工程工作区。
 
-HierGR-SeqRec/
+## 为什么做这个项目
+
+很多推荐系统项目往往只覆盖其中一个层面：
+
+- 基础序列建模；
+- 基础召回 / 检索；
+- 或者单一训练循环。
+
+这个项目尝试处理一个更难、更接近真实场景的问题：推荐质量不仅取决于**语义相关性**，还取决于**地理邻近性**和**时间行为模式**。
+
+这个仓库重点展示了以下能力：
+
+1. 从原始评论数据出发，构建结构化推荐输入；
+2. 为大规模 POI 词表学习紧凑的语义 ID 表示；
+3. 将 LLM 微调为生成式推荐器；
+4. 通过自定义奖励函数引入强化学习优化；
+5. 保留并维护双塔检索基线，便于对照实验；
+6. 从推荐指标、层级匹配、空间距离等多个维度进行评估。
+
+## 这个项目体现了什么能力
+
+- **端到端机器学习系统设计**：从原始 Yelp 数据到表征学习、Prompt 构造、训练、推理、评估的一整套链路。
+- **LLM 工程能力**：LoRA 微调、语义 ID token 扩展、checkpoint 合并与推理接入。
+- **推荐系统建模能力**：基于 RQ-VAE 的语义压缩建模，并将地理特征融入 POI 表示。
+- **多范式建模能力**：同一仓库内同时维护生成式推荐、双塔排序与 RL 优化路径。
+- **评估与诊断意识**：离线排序指标、层级语义匹配分析、空间距离评估、误差分析和可视化。
+- **研究工程习惯**：保留多版本实验脚本、ablation 风格分支、调试工具和独立说明文档。
+
+## 核心思路
+
+```text
+Yelp 商家数据 + 评论数据
+            ↓
+构建 POI 画像
+            ↓
+文本嵌入 + 经纬度联合编码
+            ↓
+RQ-VAE 学习层级语义 ID
+            ↓
+构建用户行为序列
+            ↓
+生成多任务 Prompt / 排序训练数据
+            ↓
+训练推荐模型
+  ├─ HierGR：基于 LLM 的生成式推荐
+  └─ PinRec / Ultimate：双塔排序路线
+            ↓
+可选的 GRPO / hard-mining 强化优化
+            ↓
+推理、评估、诊断、可视化
+```
+
+## 主要模块
+
+### 1. 基于 RQ-VAE 的层级语义 ID
+
+项目不会直接依赖原始 POI ID，而是先为每个商家学习一个结构化语义编码。RQ-VAE 流程会联合使用文本语义嵌入和经纬度特征，因此最终得到的表示同时包含**语义信息**和**空间信息**。
+
+### 2. 生成式推荐主线（HierGR）
+
+项目使用基于 Qwen 的因果语言模型，根据用户历史行为预测下一个语义 ID。推理流程支持：
+
+- tokenizer 扩展语义 ID token；
+- 加载 LoRA checkpoint；
+- 将预测簇映射回具体商家候选。
+
+### 3. 检索 / 排序路线（PinRec / Ultimate）
+
+除了生成式路径，仓库中还包含一条完整的双塔推荐路线，例如：
+
+- `models/pinrec_llm.py`
+- `models/pinrec_ultimate.py`
+- `models/pinrec_ultimate_v2.py`
+
+这使得项目既可以做生成式实验，也可以做排序式对照。
+
+### 4. 强化学习与排序实验
+
+仓库中包含多种 GRPO 训练脚本、约束生成逻辑、稠密奖励实现，以及更大的 `Rank-GRPO/` 实验子树，用于教师-学生训练、hard-mining 和 reranking 场景。
+
+## 亮点特性
+
+- **4 步数据处理流水线**：将原始 Yelp 商家 / 评论 JSON 转换为可训练推荐数据。
+- **位置感知的语义 ID 生成**：将文本嵌入与归一化经纬度联合用于语义量化。
+- **生成式下一地点预测**：通过 LLM 微调实现 Next-POI 生成式推荐。
+- **约束式解码机制**：通过 Trie / constrained logits processor 限制无效输出。
+- **并行排序基线**：通过 PinRec 与 Ultimate 双塔模型保留检索式对照实验。
+- **完整评估工具链**：覆盖 HR@K / NDCG@K / MRR、距离分析、聚类纯度检查与 t-SNE 验证。
+
+## 技术栈
+
+### 建模与训练
+- PyTorch
+- Transformers
+- PEFT / LoRA
+- Sentence Transformers
+- RQ-VAE 风格量化建模
+
+### 数据处理
+- Datasets
+- NumPy
+- Pandas
+- scikit-learn
+- PyYAML
+- tqdm
+
+### 检索与向量工具
+- FAISS（CPU）
+
+### 可视化与分析
+- matplotlib
+- seaborn
+- UMAP
+
+## 仓库结构
+
+```text
+SpaceTime-GR/
 ├── config/
-│   └── config.yaml                   # 全局配置文件
-│
-├── data/                             # 数据存储目录
-│   ├── raw/                          # 原始Yelp数据
-│   │   ├── yelp_academic_dataset_business.json
-│   │   └── yelp_academic_dataset_review.json
-│   ├── processed/                    # 处理后数据
-│   │   ├── item_profiles.jsonl       # 商家画像
-│   │   ├── item_embeddings.pt        # BERT嵌入
-│   │   ├── sid_mapping.json          # 商家ID→语义ID映射
-│   │   ├── user_sequences.jsonl      # 用户序列
-│   │   ├── train_prompts.jsonl       # 训练Prompts
-│   │   ├── train_prompts_balanced.jsonl  # 平衡采样版本
-│   │   ├── valid_prompts.jsonl       # 验证集
-│   │   ├── test_prompts.jsonl        # 测试集
-│   │   └── category_weights.json     # 类别权重表
-│   ├── embeddings/                   # 嵌入向量缓存
-│   ├── rqvae_ckpt/                   # RQ-VAE模型检查点
-│   ├── llm_ckpt_sft_v5_balanced/     # SFT训练检查点
-│   └── grpo_v5_weighted/             # GRPO训练检查点
-│
-├── data_processing/                  # 数据处理流水线
-│   ├── step1_build_item_profile.py   # 构建商家画像
-│   ├── step2_generate_semantic_ids.py # 训练RQ-VAE + 生成SID
-│   ├── step3_build_user_sequences.py # 构建用户行为序列
-│   ├── step4_construct_prompts.py    # 构造多任务Prompts
-│   ├── balance_dataset.py            # 长尾类别平衡采样
-│   └── analyze_chain_stores.py       # 连锁店分析工具
-│
-├── RQ-VAE/                           # RQ-VAE核心实现
+│   └── config.yaml                  # 主配置文件
+├── data_processing/
+│   ├── step1_build_item_profile.py  # 从 Yelp 数据构建 POI 画像
+│   ├── step2_generate_semantic_ids.py
+│   ├── step3_build_user_sequences.py
+│   ├── step4_construct_prompts.py
+│   └── README.md                    # 数据流程说明
+├── RQ-VAE/
 │   ├── models/
-│   │   ├── rqvae.py                  # RQ-VAE模型定义
-│   │   ├── quantizers.py             # 量化器（Sinkhorn-Knopp）
-│   │   └── encoder_decoder.py        # 编码器-解码器
-│   └── trainer.py                    # RQ-VAE训练器
-│
-├── training/                         # LLM训练模块
-│   ├── train_sft_final.py            # SFT训练脚本（V5终极版）
-│   ├── train_grpo_v5.py              # GRPO训练脚本（V5加权版）
-│   ├── grpo_rewards_optimized.py     # 优化奖励函数
-│   ├── constrained_logits_processor.py # Trie约束生成
-│   ├── dataset.py                    # 数据集加载器
-│   ├── merge_model.py                # LoRA模型合并工具
-│   └── GRPO_TRAINING_GUIDE.md        # GRPO训练指南
-│
-├── inference/                        # 推理与评估
-│   ├── new_evaluate.py               # 完整评估脚本
-│   ├── evaluate_metrics.py           # 层级准确率统计
-│   ├── validate_grpo_with_tsne.py    # t-SNE可视化验证
-│   ├── check_sft_quality.py          # SFT质量检查
-│   ├── check_cluster_purity.py       # 聚类纯度分析
-│   ├── recommend.py                  # 在线推荐接口
-│   └── trie_utils.py                 # Trie树工具类
-│
-├── visualization/                    # 可视化脚本
-│   ├── plot_training_curves.py       # 训练曲线绘制
-│   ├── plot_tsne.py                  # t-SNE降维可视化
-│   └── plot_category_distribution.py # 类别分布图
-│
-├── evaluation/                       # 评估工具
-│   ├── metrics.py                    # 评估指标（Hit@K, NDCG@K）
-│   └── geo_utils.py                  # 地理距离计算
-│
-├── examples/                         # 示例脚本
-│   ├── quick_demo.py                 # 快速演示
-│   └── batch_inference.py            # 批量推理
-│
-├── run_pipeline.py                   # 全流程自动化脚本
-├── inspect_data.py                   # 数据检查工具
-├── requirements.txt                  # Python依赖
-├── README.md                         # 项目文档
-├── QUICKSTART.md                     # 快速开始指南
-└── MODEL_PATHS.md                    # 模型路径配置说明
-
-## 项目架构
-=======
-### merge_model.py合并最优模型
-
-## 🌟 核心特性
-
-### 1. **层级语义 ID（Hierarchical Semantic IDs）**
-- 使用 **RQ-VAE（Residual Quantized VAE）** 将商家编码为 3 层语义 ID + 1 层唯一后缀
-- 层级结构：`<Layer0: Region> <Layer1: District> <Layer2: Category> <Suffix: Unique>`
-- 完全消除 ID 冲突（冲突率从 98.1% 降至 0%）
-- 输入维度：770d（768d BERT + 2d 经纬度）
-
-### 2. **双模型架构（Dual-Model Architecture）**
-- **HierGR（生成式）**: 基于 Qwen2.5-1.5B 的序列到序列生成模型
-  - 使用 Trie 树约束生成，确保输出有效 ID
-  - 支持 Beam Search 和约束采样
-  - LoRA 微调，支持 SFT + GRPO 两阶段训练
-  
-- **PinRec（判别式）**: 双塔检索模型
-  - Item Tower: 内容特征 + 哈希嵌入
-  - User Tower: LLM Backbone + 时序编码
-  - 支持 LogQ 采样偏差修正
-
-### 3. **多阶段训练（Multi-Stage Training）**
-- **Stage 1 (SFT)**: 监督微调学习格式和基础推荐能力
-  - 训练脚本：`train_sft_final.py`, `train_pinrec_sft_final.py`
-  - 学习率：2e-5，LoRA r=64
-  
-- **Stage 2 (GRPO)**: 强化学习优化地理感知和语义准确度
-  - 训练脚本：`train_grpo_v3.py`, `train_pinrec_grpo_final.py`
-  - 三维奖励函数：Format + Geo + Semantic
-  - 学习率：1e-6，Beta=0.04
-
-### 4. **地理感知推荐（Location-Aware Recommendation）**
-- RQ-VAE 输入融合经纬度信息（770d = 768d + 2d）
-- GRPO 奖励函数包含地理距离惩罚（Haversine 距离）
-- 平均推荐距离误差：11.2 km
-
-### 5. **统一评估框架（Unified Evaluation Framework）**
-- **compare_models_unified.py**: 一键对比 HierGR vs PinRec
-- 自动处理 String ID ↔ Integer ID 映射
-- 支持 Hit@K 和 NDCG@K 指标
-- 智能 Checkpoint 加载和回退机制
-
-
-
-
-
-```
-用户历史序列 → RQ-VAE编码 → 4层语义ID → LLM生成 → 推荐结果
-                ↓                    ↓
-            地理信息融合          SFT + GRPO训练
+│   └── trainer.py                   # RQ-VAE 训练实现
+├── models/
+│   ├── pinrec_llm.py
+│   ├── pinrec_ultimate.py
+│   └── pinrec_ultimate_v2.py        # 双塔推荐模型变体
+├── training/
+│   ├── train_sft_final.py
+│   ├── train_llm.py
+│   ├── train_grpo_v3.py
+│   ├── train_grpo_v5.py
+│   ├── train_pinrec_sft_final.py
+│   ├── train_pinrec_grpo_final.py
+│   ├── train_ultimate_v4_stable.py
+│   ├── constrained_logits_processor.py
+│   ├── merge_model.py
+│   └── GRPO_TRAINING_GUIDE.md
+├── inference/
+│   ├── recommend.py                 # 推荐推理入口
+│   ├── new_evaluate.py
+│   ├── evaluate_final_v9.py
+│   ├── evaluate_metrics.py
+│   ├── check_sft_quality.py
+│   ├── check_cluster_purity.py
+│   ├── analyze_errors.py
+│   ├── demo_inference.py
+│   └── validate_grpo_with_tsne.py
+├── evaluation/
+│   ├── evaluate_model.py            # 独立评估工具链
+│   ├── quick_test.py
+│   ├── compare_results.py
+│   ├── EVALUATION_GUIDE.md
+│   └── README.md
+├── examples/
+│   ├── user_history_example.json
+│   └── user_location_example.json
+├── Rank-GRPO/                       # 进阶排序 / reranking 实验
+├── yelp18Eval/                      # 额外评估相关资源
+├── requirements.txt
+└── run_pipeline.py                  # 粗粒度流程入口
 ```
 
-### 核心组件
-- **RQ-VAE**: 将商家编码为 4 层语义 ID `<c0, c1, c2, suffix>`
-- **LLM**: Qwen2.5-1.5B + LoRA 微调
-- **训练**: SFT（格式学习）+ GRPO（精准度优化）
+## 推荐阅读顺序
 
----
+如果你是从“工程深度评估”的角度阅读这个仓库，建议按下面顺序看：
 
-## 最近更新（Training & Inference 模块）
+1. `config/config.yaml`：先理解路径、训练配置和整体假设；
+2. `data_processing/README.md` + `step1~4`：理解原始 Yelp 数据如何变成训练输入；
+3. `training/train_sft_final.py` 和 `training/train_grpo_v5.py`：查看生成式训练主线；
+4. `models/pinrec_ultimate_v2.py` 和 `training/train_pinrec_sft_final.py`：查看排序 / 检索路线；
+5. `inference/recommend.py` 和 `evaluation/evaluate_model.py`：查看推理与评估如何落地；
+6. `Rank-GRPO/`：查看更复杂的排序与教师-学生实验。
 
-### 🔧 训练模块改进 (`training/`)
+## 环境要求
 
-#### 1. **`train_llm.py`** - SFT 训练脚本（已修复）
+### 软件环境
+- Python 3.8+
+- 建议使用支持 CUDA 的环境进行训练 / 推理
+- 需要本地可访问的 Qwen 基座模型 checkpoint（默认配置使用本地路径）
 
-**关键修复：**
-- ✅ **修复 `ValueError: model did not return a loss`**
-  - 在 `tokenize_function` 中显式创建 `labels` 字段
-  - `labels = input_ids.copy()` 用于 Causal LM 训练
-  
-- ✅ **修复 LoRA + Gradient Checkpointing 兼容性**
-  - 添加 `model.enable_input_require_grads()` 
-  - 确保梯度能正确反向传播到 LoRA 层
+### 数据
+- Yelp business JSON
+- Yelp review JSON
 
-- ✅ **优化数据处理**
-  - 使用 `DataCollatorForSeq2Seq` 自动处理 padding
-  - 将 padding token 的 label 设为 -100（忽略 loss 计算）
+### 模型与中间产物
+如果要完整复现实验，一般还需要：
 
-**代码示例：**
-```python
-def tokenize_function(examples):
-    model_inputs = self.tokenizer(
-        examples["text"],
-        truncation=True,
-        max_length=self.llm_conf['max_seq_length'],
-        padding=False 
-    )
-    # [关键] 显式创建 labels
-    model_inputs["labels"] = model_inputs["input_ids"].copy()
-    return model_inputs
-```
+- 放在 `data/raw/` 下的原始 Yelp 数据；
+- 处理后的中间文件，例如 `sid_mapping.json`；
+- 本地基础 LLM checkpoint；
+- SFT / GRPO / PinRec 等训练完成的 checkpoint（若要直接推理或评估）。
 
-#### 2. **`train_grpo_v2.py`** - GRPO 优化版本（新增）
-
-**改进点：**
-- 从 SFT checkpoint 重新开始训练（而非继续训练）
-- 增加 LoRA 秩：`r=64`（提升学习能力）
-- 调整采样温度：`temperature=1.2`（鼓励探索不同 ID）
-- 增加 KL 惩罚：`beta=0.04`（防止遗忘 SFT 知识）
-- 使用优化的奖励函数 `grpo_rewards_optimized.py`
-
-**使用方法：**
-```bash
-python training/train_grpo_v2.py
-```
-
-#### 3. **`grpo_rewards_optimized.py`** - 优化奖励函数（新增）
-
-**三维度奖励系统：**
-
-| 奖励类型 | 计算逻辑 | 权重分配 |
-|---------|---------|---------|
-| **Format Reward** | 格式正确: +0.1<br>有内容但格式错: -0.9<br>空输出: -1.0 | 基础 |
-| **Geo Reward** | ≤5km: +0.3<br>≤20km: +0.1<br>≤50km: 0.0<br>>50km: -0.1 | 核心 |
-| **Semantic Reward** | Layer0匹配: +0.1<br>Layer1匹配: +0.2<br>Layer2匹配: +1.0<br>完全匹配: +3.0 | 递进 |
-
-**关键特性：**
-- 支持 String 和 List 格式的 `target_sid` 解析
-- 完美适配 Step2/Step4 生成的数据格式
-- 使用 Haversine 公式计算地理距离
-
-#### 4. **`constrained_logits_processor.py`** - 约束生成（新增）
-
-**功能：**
-- 基于 Trie 数据结构约束生成
-- 确保模型只输出有效的 Cluster IDs
-- 支持 Beam Search 的约束生成
-
-**工作原理：**
-```python
-# 构建 Trie 索引所有有效 ID
-trie.insert("<12, 34, 56, 0>")
-trie.insert("<12, 34, 56, 1>")
-
-# 生成时约束 logits
-allowed_tokens = trie.get_next_tokens(current_prefix)
-scores[~allowed_tokens] = -inf  # 屏蔽无效 token
-```
-
-#### 5. **`GRPO_TRAINING_GUIDE.md`** - 完整训练指南（新增）
-
-包含：
-- GRPO 核心概念（Group Relative Policy Optimization）
-- 约束生成机制详解
-- 超参数调优建议
-- 常见问题排查
-
----
-
-### 📊 推理模块改进 (`inference/`)
-
-#### 1. **`new_evaluate.py`** - 量化评估脚本（新增）
-
-**功能：**
-- 加载 SFT + GRPO 模型
-- 使用 Trie 约束生成确保输出有效
-- 计算完整评估指标
-
-**评估指标：**
-- Hit@K, NDCG@K（标准推荐指标）
-- 平均距离误差（地理准确性）
-- 层级匹配准确率（Layer 0-3）
-
-**使用方法：**
-```bash
-python inference/new_evaluate.py
-```
-
-**输出示例：**
-```
-FINAL RESULTS (N=500)
-========================================
-Mean Distance Error: 11.2 km
---------------------
-Hit@1 : 0.3400 | NDCG@1 : 0.3400
-Hit@5 : 0.5200 | NDCG@5 : 0.4100
-Hit@10: 0.6100 | NDCG@10: 0.4350
---------------------
-Hierarchical Accuracy (Top-1):
-Layer 0 Match (City/Region): 78%
-Layer 1 Match (District)   : 65%
-Layer 2 Match (Category)   : 52%
-Exact Match (Item)         : 34%
-========================================
-```
-
-#### 2. **`validate_grpo_with_tsne.py`** - 可视化验证（新增）
-
-**功能：**
-- 使用 t-SNE 可视化 RQ-VAE 编码空间
-- 验证 GRPO 预测是否落在正确的城市聚类
-- 生成预测路径可视化图
-
-**关键修复：**
-- 修复 Prompt 构建问题
-- 使用 `apply_chat_template` 确保格式正确
-- 降低温度 `temperature=0.1` 让模型更确定地输出 ID
-
-**使用方法：**
-```bash
-python inference/validate_grpo_with_tsne.py
-```
-
-**输出：** `data/visualization/grpo_validation_tsne.png`
-
-#### 3. **`evaluate_metrics.py`** - 增强评估（改进）
-
-**新增功能：**
-- 层级准确率统计（Layer 0-3 逐层匹配）
-- 更详细的评估报告
-- 支持自定义测试集大小
-
-**层级准确率说明：**
-```python
-# 只要 Top-1 预测的前 N 层匹配就算对
-if pred[0] == target[0]:  # Layer 0 (城市/大区)
-    layer_hits[0] += 1
-    if pred[1] == target[1]:  # Layer 1 (街区)
-        layer_hits[1] += 1
-        if pred[2] == target[2]:  # Layer 2 (类别)
-            layer_hits[2] += 1
-            if pred[3] == target[3]:  # Layer 3 (商家)
-                layer_hits[3] += 1  # 完全命中
-```
-
-#### 4. **`check_sft_quality.py`** - SFT 质量检查（改进）
-
-**功能：**
-- 快速验证 SFT 模型是否学会了新的 4 层 ID 格式
-- 检查生成的 ID 是否在映射表中
-- 提供详细的诊断信息
-
-**使用方法：**
-```bash
-python inference/check_sft_quality.py
-```
-
-**输出示例：**
-```
-✅ Valid ID! Mapped to: Starbucks in Phoenix
-   (Prediction is valid, even if not Ground Truth)
-```
-
-#### 5. **`check_cluster_purity.py`** - 聚类纯度分析（新增）
-
-**功能：**
-- 分析 Layer 2（类别层）的语义纯度
-- 统计每个聚类的类别分布
-- 验证 RQ-VAE 是否学到了有意义的聚类
-
-#### 6. **`recommend.py`** - 在线推荐（改进）
-
-**功能：**
-- 完整的推荐流程实现
-- 支持地理位置过滤
-- Beam Search 生成多个候选
-
-**使用方法：**
-```bash
-python inference/recommend.py \
-    --user_history user_history.json \
-    --user_location location.json \
-    --top_k 10
-```
-
----
-
-## 快速开始
-
-### 1. 环境安装
-```bash
-pip install torch transformers peft trl geopy bitsandbytes scikit-learn matplotlib seaborn
-```
-
-### 2. 数据处理
-```bash
-# Step 1-4: 数据预处理
-python data_processing/step1_build_item_profile.py
-python data_processing/step2_generate_semantic_ids.py
-python data_processing/step3_build_user_sequences.py
-=======
-## 📂 项目结构
-
-```
-HierGR-SeqRec/
-├── config/
-│   └── config.yaml                      # 全局配置文件
-│
-├── data/                                # 数据存储
-│   ├── raw/                             # 原始 Yelp 数据
-│   ├── processed/                       # 处理后数据
-│   │   ├── item_profiles.jsonl          # 商家画像
-│   │   ├── sid_mapping.json             # 语义 ID 映射
-│   │   ├── train_ultimate.jsonl         # Ultimate 格式训练集
-│   │   ├── valid_ultimate.jsonl         # 验证集
-│   │   └── test_ultimate.jsonl          # 测试集
-│   ├── embeddings/                      # BERT 嵌入缓存
-│   ├── rqvae_ckpt/                      # RQ-VAE 检查点
-│   └── llm_ckpt_*/                      # LLM 训练检查点
-│
-├── data_processing/                     # 数据处理流水线
-│   ├── step1_build_item_profile.py      # 构建商家画像
-│   ├── step2_generate_semantic_ids.py   # 训练 RQ-VAE
-│   ├── step3_build_user_sequences.py    # 构建用户序列
-│   ├── step4_construct_prompts.py       # 构造训练数据
-│   ├── balance_dataset.py               # 类别平衡采样
-│   └── analyze_chain_stores.py          # 连锁店分析
-│
-├── RQ-VAE/                              # RQ-VAE 核心实现
-│   ├── models/
-│   │   ├── rqvae.py                     # RQ-VAE 模型
-│   │   ├── quantizers.py                # Sinkhorn-Knopp 量化器
-│   │   └── encoder_decoder.py           # 编解码器
-│   └── trainer.py                       # RQ-VAE 训练器
-│
-├── models/                              # 推荐模型定义
-│   ├── pinrec_llm.py                    # PinRec LLM 版本
-│   ├── pinrec_ultimate.py               # PinRec Ultimate V1
-│   └── pinrec_ultimate_v2.py            # **PinRec Ultimate V2 (最新)**
-│
-├── training/                            # 训练脚本
-│   ├── train_sft_final.py               # **HierGR SFT 训练 (推荐)**
-│   ├── train_sft_optimized.py           # SFT 优化版
-│   ├── train_grpo_v3.py                 # **HierGR GRPO V3 (推荐)**
-│   ├── train_grpo_v4_1.py               # GRPO V4.1 (Breadcrumbs)
-│   ├── train_grpo_v5.py                 # GRPO V5 (Weighted)
-│   ├── train_pinrec_sft_final.py        # **PinRec SFT 训练 (推荐)**
-│   ├── train_pinrec_grpo_final.py       # **PinRec GRPO 训练 (推荐)**
-│   ├── train_pinrec_v7_final.py         # PinRec V7 + LogQ
-│   ├── train_ultimate_v4_stable.py      # Ultimate 稳定版
-│   ├── train_ultimate_v2_logq.py        # Ultimate V2 + LogQ
-│   ├── grpo_rewards_optimized.py        # 优化奖励函数
-│   ├── grpo_rewards_v3.py               # V3 奖励函数
-│   ├── constrained_logits_processor.py  # 约束生成
-│   ├── dataset.py                       # 数据集加载器
-│   ├── merge_model.py                   # LoRA 模型合并
-│   └── GRPO_TRAINING_GUIDE.md           # GRPO 训练指南
-│
-├── inference/                           # 推理与评估
-│   ├── evaluate_ultimate_v2.py          # Ultimate V2 评估
-│   ├── evaluate_pinrec_v7_debug.py      # PinRec V7 评估调试
-│   ├── evaluate_final_v9.py             # 最终评估 V9
-│   ├── evaluate_bulletproof.py          # 防弹评估脚本
-│   ├── new_evaluate.py                  # 完整评估脚本
-│   ├── evaluate_metrics.py              # 层级准确率统计
-│   ├── validate_grpo_with_tsne.py       # t-SNE 可视化验证
-│   ├── check_sft_quality.py             # SFT 质量检查
-│   ├── check_sft_only.py                # 仅 SFT 质量检查
-│   ├── check_cluster_purity.py          # 聚类纯度分析
-│   ├── analyze_errors.py                # 错误分析工具
-│   ├── demo_inference.py                # 演示推理
-│   ├── recommend.py                     # 在线推荐接口
-│   └── trie_utils.py                    # Trie 树工具
-│
-├── compare_models_unified.py            # **统一模型对比工具 (推荐)**
-│
-├── evaluation/                          # 评估工具
-│   ├── metrics.py                       # 评估指标
-│   └── geo_utils.py                     # 地理距离计算
-│
-├── visualization/                       # 可视化脚本
-│   ├── visualize_codebook.py            # Codebook 可视化
-│   ├── visualize_codebooks_by_city.py   # 按城市可视化 Codebook
-│   └── README.md                        # 可视化指南
-│
-├── examples/                            # 示例代码
-│   ├── quick_demo.py                    # 快速演示
-│   └── batch_inference.py               # 批量推理
-│
-├── run_pipeline.py                      # 全流程自动化
-├── inspect_data.py                      # 数据检查工具
-├── requirements.txt                     # 依赖列表
-├── README.md                            # 本文档
-├── QUICKSTART.md                        # 快速开始指南
-└── MODEL_PATHS.md                       # 模型路径配置
-```
-
----
-
-## 🚀 快速开始
-
-### 1. 环境配置
+## 安装方式
 
 ```bash
-# 克隆项目
-git clone https://github.com/yourusername/HierGR-SeqRec.git
-cd HierGR-SeqRec
-
-# 安装依赖
+git clone https://github.com/edward200112/SpaceTime-GR.git
+cd SpaceTime-GR
 pip install -r requirements.txt
 ```
 
-**核心依赖：**
-```
-torch>=2.0.0
-transformers>=4.30.0
-peft>=0.4.0
-trl>=0.7.0  # GRPO 训练
-sentence-transformers>=2.2.0  # BERT 嵌入
-scikit-learn>=1.2.0
-pandas>=2.0.0
-numpy>=1.24.0
-```
+## 配置说明
 
-**可选依赖：**
-```
-bitsandbytes>=0.41.0  # QLoRA 量化
-flash-attn>=2.0.0  # Flash Attention（推荐）
-matplotlib>=3.7.0  # 可视化
-seaborn>=0.12.0
-```
+主配置文件位于 `config/config.yaml`。
 
-### 2. 准备数据
+当前配置的几个重要假设包括：
 
-#### 2.1 下载 Yelp 数据集
-从 [Yelp Dataset](https://www.yelp.com/dataset) 下载以下文件到 `data/raw/`：
-- `yelp_academic_dataset_business.json`
-- `yelp_academic_dataset_review.json`
+- 原始 Yelp 数据默认放在类似 `/workspace/data/raw` 的路径；
+- 处理结果和 checkpoint 也默认写入 `/workspace/data/...`；
+- 基础模型路径默认是 `/workspace/Qwen2_5-1.5B-Instruct`；
+- LLM 训练默认采用 LoRA 微调；
+- RQ-VAE 模块默认使用文本 + 地理特征融合表示；
+- GRPO 模块配置了语义、地理、格式、命中等稠密奖励项。
 
-#### 2.2 下载预训练模型
-推荐使用 **Qwen2.5-1.5B-Instruct**：
-```bash
-huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct \
-    --local-dir /workspace/Qwen2_5-1.5B-Instruct
-```
+在本地运行前，至少建议先修改以下字段：
 
-更新 `config/config.yaml`:
 ```yaml
+data:
+  raw_dir: "/your/local/path/data/raw"
+  processed_dir: "/your/local/path/data/processed"
+  embeddings_dir: "/your/local/path/data/embeddings"
+  rqvae_ckpt_dir: "/your/local/path/data/rqvae_ckpt"
+  llm_ckpt_dir: "/your/local/path/data/llm_ckpt"
+
 llm:
-  model_name: "/workspace/Qwen2_5-1.5B-Instruct"
+  model_name: "/your/local/path/Qwen2_5-1.5B-Instruct"
+
+hardware:
+  device: "cuda"
 ```
 
-### 3. 数据处理流水线
+## 数据准备
+
+先将 Yelp 原始文件放到 `data/raw/`：
+
+```text
+data/raw/
+├── yelp_academic_dataset_business.json
+└── yelp_academic_dataset_review.json
+```
+
+然后按顺序执行核心数据流水线：
 
 ```bash
-# Step 1: 构建商家画像（聚合名称、类别、评论、位置信息）
 python data_processing/step1_build_item_profile.py
-
-# Step 2: 训练 RQ-VAE 并生成语义 ID
 python data_processing/step2_generate_semantic_ids.py
-
-# Step 3: 构建用户交互序列
 python data_processing/step3_build_user_sequences.py
-
-# Step 4: 构造训练 Prompts（多任务格式）
 python data_processing/step4_construct_prompts.py
+```
 
-# (可选) 长尾类别平衡采样
+`data_processing/` 下还包含一些可选的数据平衡脚本，例如：
+
+```bash
 python data_processing/balance_dataset.py
+python data_processing/balance_sequences_for_pinrec.py
+python data_processing/balance_ultimate_data.py
 ```
 
+## 快速开始
 
-### 3. 模型训练
+### 方案 A：先理解流程
 
-#### SFT 训练（必须）
+如果你暂时不想复现实验，只想先理解代码组织和流程，可以先运行：
+
 ```bash
-python training/train_llm.py
+python run_pipeline.py --step data
 ```
 
-**检查 SFT 质量：**
+### 方案 B：基于已准备好的产物做推荐推理
+
+在配置文件、处理后数据和 checkpoint 已准备好的前提下，可以直接运行：
+
 ```bash
-python inference/check_sft_quality.py
+python inference/recommend.py \
+  --config ./config/config.yaml \
+  --user_history ./examples/user_history_example.json \
+  --user_location ./examples/user_location_example.json \
+  --top_k 10
 ```
 
-#### GRPO 训练（可选，提升精准度）
-```bash
-# 推荐使用优化版本
-python training/train_grpo_v2.py
+## 训练路径
 
-# 或使用基础版本
-python training/train_grpo.py
-=======
-**输出文件：**
-- `data/processed/item_profiles.jsonl`
-- `data/processed/sid_mapping.json`
-- `data/processed/train_ultimate.jsonl`
-- `data/processed/valid_ultimate.jsonl`
-- `data/processed/test_ultimate.jsonl`
+这个仓库支持多条实验路线，而不是只有一个“官方唯一训练命令”。
 
-### 4. 模型训练
+### HierGR / 生成式路线
 
-#### 方案 A: **HierGR (生成式) - SFT + GRPO**（推荐：最佳性能）
+推荐先看：
 
-**Stage 1: 监督微调（SFT）**
 ```bash
 python training/train_sft_final.py
+python training/train_grpo_v5.py
 ```
 
-**特点：**
-- 基于 Qwen2.5-1.5B-Instruct
-- LoRA 微调（r=64, alpha=128）
-- 学习率：2e-5，3 epochs
-- 输出格式：`<c0, c1, c2, suffix>`
+仓库中还保留了多种实验版本：
 
-**Stage 2: 强化学习（GRPO V3）**
 ```bash
+python training/train_llm.py
+python training/train_grpo.py
+python training/train_grpo_v2.py
 python training/train_grpo_v3.py
+python training/train_grpo_v4.py
+python training/train_grpo_v4_1.py
+python training/train_grpo_v4_2_optimized.py
+python training/train_grpo_v4_3_logit_masking.py
+python training/train_grpo_v4_4_cot.py
 ```
 
-**特点：**
-- 三维奖励函数：Format + Geo + Semantic
-- 学习率：1e-6（比 SFT 小 20 倍）
-- Beta=0.04（KL 散度惩罚）
-- 支持 Trie 树约束生成
+### PinRec / Ultimate 排序路线
 
-**GRPO 奖励函数（三维度）：**
-| 维度 | 计算方式 | 权重 |
-|------|---------|------|
-| **Format Reward** | 格式正确: +0.1<br>格式错误: -1.0 | 基础 |
-| **Geo Reward** | ≤1km: +0.5<br>≤5km: +0.2<br>≤20km: 0.0<br>>20km: -0.1 | 核心 |
-| **Semantic Reward** | Layer0: +0.2<br>Layer1: +0.3<br>Layer2: +1.0<br>Exact: +2.0 | 递进 |
-
-#### 方案 B: **PinRec (判别式) - SFT + GRPO**（推荐：快速收敛）
-
-**Stage 1: PinRec SFT**
 ```bash
 python training/train_pinrec_sft_final.py
-```
-
-**特点：**
-- 双塔架构（Item Tower + User Tower）
-- 内容特征 + 哈希嵌入
-- 时序编码（Time Delta Encoder）
-- 分类 Loss + Pairwise Loss
-
-**Stage 2: PinRec GRPO**
-```bash
 python training/train_pinrec_grpo_final.py
-```
-
-**特点：**
-- 在 SFT 基础上继续优化
-- 支持 LogQ 采样偏差修正
-- 智能 Checkpoint 管理
-
-#### 方案 C: **Ultimate V4 Stable**（推荐：稳定训练）
-
-```bash
+python training/train_pinrec_v7_final.py
 python training/train_ultimate_v4_stable.py
 ```
 
-**特点：**
-- 基于 PinRec Ultimate V2 双塔架构
-- 分类 Loss（Softmax）+ 排序 Loss（Pairwise）
-- 自动 Checkpoint 管理（保留最新 3 个）
-- 适合快速迭代和调试
+### 更大的 7B 实验
 
-**配置：**
-```python
-batch_size = 64
-learning_rate = 1e-4
-num_epochs = 20
-max_history_len = 40
-```
+`training/` 目录中还包含针对 7B 模型的脚本，例如：
 
-### 5. 模型评估
-
-#### 🏆 统一对比评估（推荐）
 ```bash
-# 一键对比 HierGR vs PinRec
-python compare_models_unified.py
+python training/7B_train_sft_optimized.py
+python training/7B_train_grpo.py
+python training/7B_train_GRPO_optimized_resume.py
 ```
 
-**特点：**
-- 自动处理 String ID ↔ Integer ID 映射
-- 支持 Hit@K 和 NDCG@K 指标
-- 智能 Checkpoint 加载和回退
-- 批量推理，高效评估
+## 评估方式
 
-**配置：**
-```python
-CONFIG = {
-    "test_data": "/workspace/data/processed/train_prompts.jsonl",
-    "sid_mapping": "/workspace/data/processed/sid_mapping.json",
-    "item_profiles": "/workspace/data/processed/item_profiles.jsonl",  # 关键！
-    "num_samples": 500,  # 测试样本数
-    "top_k_list": [1, 5, 10, 20],
-    
-    "hier": {
-        "enabled": True,
-        "sft_ckpt": "/workspace/data/llm_ckpt_sft_v2_optimized/checkpoint-35000",
-        "grpo_ckpt": "/workspace/data/grpo_v4_1_breadcrumbs/checkpoint-5000",
-        "beams": 10
-    },
-    
-    "pinrec": {
-        "enabled": True,
-        "sft_ckpt": "/workspace/data/pinrec_ckpt_sft_final_v3/checkpoint-48000",
-        "grpo_ckpt": "/workspace/data/pinrec_ckpt_grpo_aggressive/checkpoint-10000"
-    }
-}
-```
+### 推荐效果评估
 
-#### 单模型评估
 ```bash
-# Ultimate V2 评估
-python inference/evaluate_ultimate_v2.py
-
-# PinRec V7 评估（带调试信息）
-python inference/evaluate_pinrec_v7_debug.py
-
-# 最终评估 V9
-python inference/evaluate_final_v9.py
-
-# 防弹评估（最稳定）
-python inference/evaluate_bulletproof.py
+python evaluation/evaluate_model.py \
+  --config ./config/config.yaml \
+  --test_data ./data/processed/test_prompts.jsonl \
+  --batch_size 8 \
+  --num_beams 5 \
+  --top_k 5,10,20 \
+  --use_constrained_generation \
+  --output ./evaluation/results.json
 ```
 
-#### 可视化验证
+### 快速交互检查
+
 ```bash
-# t-SNE 可视化
-python inference/validate_grpo_with_tsne.py
-
-# Codebook 可视化
-python visualization/visualize_codebook.py
-
-# 按城市可视化 Codebook
-python visualization/visualize_codebooks_by_city.py
+python evaluation/quick_test.py --config ./config/config.yaml
 ```
 
-#### 质量检查
+### 推理侧评估与分析工具
+
 ```bash
-# SFT 质量检查
-python inference/check_sft_quality.py
-
-# 仅 SFT 质量检查
-python inference/check_sft_only.py
-
-# 聚类纯度分析
-python inference/check_cluster_purity.py
-
-# 错误分析
-python inference/analyze_errors.py
-
-```
-
-### 4. 模型评估
-```bash
-# 完整评估
 python inference/new_evaluate.py
-
-# 可视化验证
-python inference/validate_grpo_with_tsne.py
-
-# 聚类质量分析
+python inference/evaluate_final_v9.py
+python inference/evaluate_metrics.py
+python inference/check_sft_quality.py
 python inference/check_cluster_purity.py
-```
-
----
-
-
-## 训练效果
-
-### SFT 阶段
-- ✅ 100% 学会 `<c0, c1, c2, suffix>` 格式
-- ✅ 验证集推理格式正确率 100%
-
-### GRPO 阶段（前 8% 训练）
-
-| 指标 | 初始值 | 当前值 | 提升 |
-|-----|-------|-------|-----|
-| Format Reward | 0.50 | 0.50 | ✅ 保持完美 |
-| Geo Reward | 0.20 | 0.44 | 🚀 +120% |
-| Semantic Reward | 0.13 | 0.24 | 📈 +85% |
-| 平均距离误差 | 16km | 11.2km | ✅ -30% |
-
----
-
-## 核心技术突破
-
-### 1. ID 冲突解决
-- **问题**: RQ-VAE 碰撞率 98.1%
-- **方案**: 添加 Unique Suffix（第4层）
-- **结果**: 碰撞率降至 0.0%
-
-### 2. 地理感知
-- **问题**: 模型推荐距离用户很远的商家
-- **方案**: 
-  - RQ-VAE 编码时融合经纬度
-  - GRPO 奖励函数加入地理距离
-- **结果**: 平均误差从 16km 降至 11.2km
-
-### 3. 训练稳定性
-- **问题**: GRPO 训练不收敛
-- **方案**:
-  - 密集奖励替代稀疏奖励
-  - 层级语义奖励递进
-  - 约束生成确保输出有效
-- **结果**: 训练稳定收敛
-
----
-
-## 文件结构
-
-```
-HierGR-SeqRec/
-├── training/
-│   ├── train_llm.py              # [改进] SFT训练（修复labels问题）
-│   ├── train_grpo.py             # GRPO训练基础版
-│   ├── train_grpo_v2.py          # [新增] GRPO优化版
-│   ├── grpo_rewards.py           # 原始奖励函数
-│   ├── grpo_rewards_optimized.py # [新增] 优化奖励函数
-│   ├── constrained_logits_processor.py  # [新增] 约束生成
-│   ├── dataset.py                # 数据集处理
-│   └── GRPO_TRAINING_GUIDE.md    # [新增] 训练指南
-│
-├── inference/
-│   ├── new_evaluate.py           # [新增] 量化评估
-│   ├── evaluate_metrics.py       # [改进] 增强评估
-│   ├── validate_grpo_with_tsne.py # [新增] 可视化验证
-│   ├── check_sft_quality.py      # [改进] SFT质量检查
-│   ├── check_cluster_purity.py   # [新增] 聚类纯度分析
-│   ├── recommend.py              # [改进] 在线推荐
-│   └── trie_utils.py             # Trie工具
-│
-├── data_processing/              # 数据预处理脚本
-├── config/                       # 配置文件
-└── README.md                     # 本文档
-=======
-## 📊 性能指标
-
-### Baseline vs. Ultimate V4
-
-| 模型 | Hit@5 | NDCG@5 | Hit@10 | NDCG@10 | 平均距离 |
-|------|-------|--------|--------|---------|---------|
-| **Random** | 0.05 | 0.03 | 0.10 | 0.04 | 45 km |
-| **PopRec** | 0.18 | 0.12 | 0.28 | 0.15 | 38 km |
-| **SFT Only** | 0.42 | 0.31 | 0.57 | 0.35 | 18 km |
-| **SFT + GRPO** | 0.52 | 0.41 | 0.61 | 0.43 | **11.2 km** |
-| **Ultimate V4** | **0.55** | **0.43** | **0.64** | **0.45** | 12.5 km |
-| **PinRec V7+LogQ** | 0.53 | 0.42 | 0.63 | 0.44 | 13.1 km |
-
-### 层级准确率（Ultimate V4）
-
-| 层级 | 语义含义 | Top-1 准确率 |
-|------|----------|-------------|
-| **Layer 0** | 城市/大区 | **78%** |
-| **Layer 1** | 街区/区域 | **65%** |
-| **Layer 2** | 商家类别 | **52%** |
-| **Layer 3** | 精确商家 | **34%** |
-
-### GRPO 训练曲线（前 10% 训练）
-
-| Epoch | Format Reward | Geo Reward | Semantic Reward | 平均距离 |
-|-------|--------------|-----------|----------------|---------|
-| **1** | 0.50 | 0.20 | 0.13 | 16.0 km |
-| **3** | 0.50 | 0.35 | 0.18 | 13.5 km |
-| **5** | 0.50 | 0.42 | 0.22 | 11.8 km |
-| **8** | 0.50 | 0.44 | 0.24 | **11.2 km** |
-
----
-
-## 🛠️ 模型架构详解
-
-### 1. **RQ-VAE（Residual Quantized VAE）**
-
-#### 架构
-```
-Input (1024-d BERT Embedding)
-    ↓
-Encoder (3-layer MLP) → [768d, 512d, 256d]
-    ↓
-4-Layer Quantization:
-  Layer 0: City/Region (64 codebooks × 256 codes)
-  Layer 1: District (64 codebooks × 256 codes)
-  Layer 2: Category (64 codebooks × 256 codes)
-  Layer 3: Suffix (unique identifier)
-    ↓
-Decoder (3-layer MLP) → [256d, 512d, 1024d]
-    ↓
-Reconstructed Embedding
-```
-
-#### 关键特性
-- **Sinkhorn-Knopp 量化器**：避免 codebook collapse
-- **残差量化**：逐层量化残差误差
-- **地理信息融合**：将经纬度拼接到 Embedding 后再编码
-
-#### 训练损失
-```python
-Loss = MSE(reconstructed, original) + commitment_loss
-```
-
-### 2. **PinRec Ultimate V2（双塔架构）**
-
-#### Item Tower
-```python
-Input: item_id (Semantic ID)
-    ↓
-4-Layer Embedding Lookup:
-  emb_0 = Embedding(vocab_size_0, 128)  # Layer 0
-  emb_1 = Embedding(vocab_size_1, 128)  # Layer 1
-  emb_2 = Embedding(vocab_size_2, 128)  # Layer 2
-  emb_3 = Embedding(vocab_size_3, 128)  # Layer 3
-    ↓
-Concatenate: [emb_0, emb_1, emb_2, emb_3] → 512d
-    ↓
-Transformer Encoder (2 layers, 8 heads)
-    ↓
-Pooling (mean/max) → 512d item representation
-```
-
-#### User Tower
-```python
-Input: history_sequence = [item_1, item_2, ..., item_N]
-    ↓
-For each item:
-  item_emb = ItemTower(item_id)  # 512d
-  temporal_emb = PositionalEncoding(timestamp)  # 64d
-  activity_emb = Embedding(activity_type, 32)  # 32d
-    ↓
-Concatenate features → 608d
-    ↓
-Transformer Encoder (4 layers, 8 heads)
-    ↓
-Attention Pooling → 512d user representation
-```
-
-#### 双塔交互
-```python
-# 1. 内积相似度
-scores = user_emb @ item_emb.T  # (B, N)
-
-# 2. Softmax Loss（分类）
-loss_cls = CrossEntropy(scores, target_indices)
-
-# 3. Pairwise Loss（排序）
-positive_scores = scores[range(B), positive_indices]
-negative_scores = scores[range(B), negative_indices]
-loss_pair = max(0, margin - positive_scores + negative_scores)
-
-# 4. 总损失
-total_loss = loss_cls + lambda_pair * loss_pair
-```
-
-### 3. **GRPO（Group Relative Policy Optimization）**
-
-#### 算法流程
-```python
-# 1. 生成多个候选
-for prompt in batch:
-    candidates = model.generate(
-        prompt,
-        num_return_sequences=4,
-        do_sample=True,
-        temperature=1.2
-    )
-    
-# 2. 计算奖励
-rewards = [compute_reward(cand, target) for cand in candidates]
-
-# 3. Group-Relative Normalization
-normalized_rewards = (rewards - mean(rewards)) / std(rewards)
-
-# 4. 策略梯度更新
-loss = -sum(log_probs * normalized_rewards) + beta * KL(policy, reference)
-```
-
-#### 奖励函数组件
-```python
-def compute_reward(prediction, target):
-    # 1. Format Reward
-    if not is_valid_format(prediction):
-        return -1.0
-    
-    # 2. Geo Reward
-    pred_location = lookup_location(prediction)
-    target_location = lookup_location(target)
-    distance = haversine_distance(pred_location, target_location)
-    geo_reward = max(0.3 - distance/5000, -0.1)
-    
-    # 3. Semantic Reward
-    semantic_reward = 0
-    for layer in range(4):
-        if prediction[layer] == target[layer]:
-            semantic_reward += [0.1, 0.2, 1.0, 2.0][layer]
-        else:
-            break
-    
-    return format_reward + geo_reward + semantic_reward
-
-```
-
----
-
-
-## 常见问题
-
-### Q1: SFT 训练报错 `ValueError: model did not return a loss`
-**A**: 已在 `train_llm.py` 中修复，确保使用最新版本。关键是在 tokenize 时显式创建 `labels` 字段。
-
-### Q2: LoRA + Gradient Checkpointing 不兼容
-**A**: 已修复，添加了 `model.enable_input_require_grads()`。
-
-### Q3: GRPO 训练不收敛
-**A**: 使用 `train_grpo_v2.py` 和 `grpo_rewards_optimized.py`，采用密集奖励和更好的超参数。
-
-### Q4: 生成的 ID 格式不对
-**A**: 
-1. 检查 SFT 是否训练充分（运行 `check_sft_quality.py`）
-2. 使用约束生成（`constrained_logits_processor.py`）
-
-### Q5: 如何可视化验证模型效果？
-**A**: 运行 `python inference/validate_grpo_with_tsne.py`，查看生成的 t-SNE 图。
-
----
-
-## 参考资料
-
-- **GRPO 论文**: [DeepSeekMath](https://arxiv.org/abs/2402.03300)
-- **MiniOneRec**: 本项目基于的开源框架
-- **TRL 库**: [Hugging Face TRL](https://github.com/huggingface/trl)
-
----
-
-## 致谢
-
-本项目基于 MiniOneRec 框架，在 Yelp 数据集上进行了大量优化。感谢开源社区的贡献。
-
----
-
-**最后更新**: 2024-12
-**维护者**: [Your Name]
-=======
-## 🎯 核心技术突破
-
-### 1. **ID 冲突解决**
-
-**问题**：3层 RQ-VAE 的 ID 冲突率高达 98.1%
-
-**解决方案**：
-1. 添加第 4 层 **Unique Suffix**
-2. 为每个冲突的 Layer2 ID 分配不同的 Suffix
-3. Suffix 空间大小 = max(冲突数量)
-
-**结果**：冲突率降至 **0.0%**
-
-```python
-# 冲突检测
-layer2_counter = Counter([sid[:3] for sid in all_sids])
-max_collision = max(layer2_counter.values())
-
-# 分配 Suffix
-suffix_vocab_size = max_collision + 10  # 预留空间
-
-for layer2_id, count in layer2_counter.items():
-    for i in range(count):
-        assign_suffix(layer2_id, suffix=i)
-```
-
-### 2. **地理感知编码**
-
-**问题**：传统 RQ-VAE 忽略地理位置，导致推荐距离过远
-
-**解决方案**：
-1. 将经纬度归一化后拼接到 BERT Embedding
-2. RQ-VAE 编码时同时学习语义和地理信息
-3. GRPO 奖励函数加入地理距离惩罚
-
-**结果**：平均推荐距离从 18km 降至 **11.2km**
-
-```python
-# 地理信息融合
-def encode_with_geo(item_embedding, lat, lon):
-    geo_features = [
-        (lat - mean_lat) / std_lat,  # 归一化纬度
-        (lon - mean_lon) / std_lon   # 归一化经度
-    ]
-    fused_embedding = torch.cat([
-        item_embedding,  # 1024d
-        torch.tensor(geo_features).to(device)  # 2d
-    ], dim=-1)  # 1026d
-    return rqvae.encode(fused_embedding)
-```
-
-### 3. **LogQ 采样偏差修正**
-
-**问题**：负采样倾向于选择流行物品，导致模型对长尾物品学习不足
-
-**解决方案**：
-1. 统计每个物品在训练集中的出现频率
-2. 计算 `log P(item)` 并用于调整损失函数
-3. 动态调整 LogQ 权重 `alpha`
-
-**结果**：长尾物品 Hit@10 提升 **15%**
-
-```python
-# LogQ 计算
-def compute_logq_weights(targets, item_frequencies):
-    log_probs = [math.log(item_frequencies[t] + 1e-9) for t in targets]
-    # 归一化到 [-1, 0] 区间
-    normalized = [(lp - min_lp) / (max_lp - min_lp) - 1 
-                  for lp in log_probs]
-    return torch.tensor(normalized)
-
-# 损失函数调整
-loss = classification_loss * (1 + alpha * logq_weights)
-```
-
-### 4. **约束生成（Constrained Generation）**
-
-**问题**：自由生成可能产生无效的 Semantic ID
-
-**解决方案**：
-1. 构建 **Trie 树** 索引所有有效 ID
-2. 在生成时约束 logits，屏蔽无效 token
-3. 支持 Beam Search 的约束生成
-
-**结果**：生成 ID 的有效性从 85% 提升至 **100%**
-
-```python
-class ConstrainedLogitsProcessor:
-    def __init__(self, trie):
-        self.trie = trie
-    
-    def __call__(self, input_ids, scores):
-        # 获取当前前缀
-        current_prefix = input_ids[0].tolist()
-        
-        # 查询 Trie 获取允许的下一个 token
-        allowed_tokens = self.trie.get_next_tokens(current_prefix)
-        
-        # 屏蔽无效 token
-        scores[:, ~allowed_tokens] = -float('inf')
-        
-        return scores
-```
-
----
-
-## 📖 详细配置说明
-
-### config/config.yaml
-
-```yaml
-# 数据配置
-data:
-  raw_dir: "data/raw"
-  processed_dir: "data/processed"
-  embedding_dim: 1024  # BERT embedding 维度
-  max_history_len: 40  # 用户历史序列最大长度
-  k_core: 5  # K-core 过滤阈值
-
-# RQ-VAE 配置
-rqvae:
-  num_layers: 4  # 4 层量化
-  num_codebooks: 64  # 每层 64 个 codebook
-  codebook_size: 256  # 每个 codebook 256 个 code
-  hidden_dims: [768, 512, 256]
-  commitment_cost: 0.25
-  learning_rate: 1e-4
-  batch_size: 256
-  num_epochs: 50
-
-# LLM 配置（SFT 训练）
-llm:
-  model_name: "/workspace/Qwen2_5-1.5B-Instruct"
-  max_seq_length: 512
-  learning_rate: 5e-5
-  batch_size: 16
-  gradient_accumulation_steps: 4
-  num_epochs: 3
-  warmup_ratio: 0.1
-  lora_r: 64
-  lora_alpha: 128
-  lora_dropout: 0.1
-
-# ==================== PinRec (判别式) ====================
-pinrec:
-  base_model: "/workspace/Qwen2_5-1.5B-Instruct"
-  embedding_dim: 1024  # Item/User 嵌入维度
-  content_dim: 384  # 内容特征维度
-  
-  # 哈希嵌入配置
-  hash_bucket_size: 50000
-  num_hash_tables: 2
-  
-  # 时序编码
-  num_time_buckets: 128
-  
-  # LoRA 配置
-  use_lora: true
-  lora_r: 32
-  lora_alpha: 64
-  
-  # 训练配置
-  learning_rate: 1e-4
-  batch_size: 64
-  num_epochs: 20
-  lambda_pairwise: 0.5  # Pairwise Loss 权重
-  logq_alpha: 0.02  # LogQ 权重（可选）
-
-# 评估配置
-evaluation:
-  metrics: ["hit", "ndcg"]  # 评估指标
-  k_values: [1, 5, 10, 20]  # Top-K 值
-  test_batch_size: 64
-  constrained_generation: true  # 是否使用约束生成
-```
-
----
-
-## 🏆 统一评估框架
-
-### compare_models_unified.py
-
-这是一个强大的统一评估工具，可以一键对比 HierGR 和 PinRec 两个模型的性能。
-
-#### 核心功能
-
-1. **自动 ID 映射**
-   - 自动处理 String ID（business_id）→ Integer ID 的转换
-   - 建立 Semantic ID Tuple → Integer ID 的反向索引
-   - 支持多种数据格式的兼容性处理
-
-2. **智能 Checkpoint 加载**
-   - 优先加载 GRPO Checkpoint
-   - 自动回退到 SFT Checkpoint
-   - 支持 adapter_config.json 的 fallback 机制
-
-3. **批量推理**
-   - 支持批量处理，提高评估效率
-   - 自动处理无效样本（缺少历史记录）
-   - 统一的 Ground Truth 提取逻辑
-
-4. **多指标评估**
-   - Hit@K（命中率）
-   - NDCG@K（归一化折损累积增益）
-   - 支持自定义 K 值列表
-
-#### 使用示例
-
-```bash
-python compare_models_unified.py
-```
-
-#### 配置说明
-
-```python
-CONFIG = {
-    # 数据路径
-    "test_data": "/workspace/data/processed/train_prompts.jsonl",
-    "sid_mapping": "/workspace/data/processed/sid_mapping.json",
-    "item_profiles": "/workspace/data/processed/item_profiles.jsonl",  # 关键！
-    
-    # 评估参数
-    "num_samples": 500,  # 测试样本数（None = 全量）
-    "top_k_list": [1, 5, 10, 20],
-    
-    # HierGR 配置
-    "hier": {
-        "enabled": True,
-        "base_model": "/workspace/Qwen2_5-1.5B-Instruct",
-        "sft_ckpt": "/workspace/data/llm_ckpt_sft_v2_optimized/checkpoint-35000",
-        "grpo_ckpt": "/workspace/data/grpo_v4_1_breadcrumbs/checkpoint-5000",
-        "device": "cuda",
-        "beams": 10  # Beam Search 大小
-    },
-    
-    # PinRec 配置
-    "pinrec": {
-        "enabled": True,
-        "sft_ckpt": "/workspace/data/pinrec_ckpt_sft_final_v3/checkpoint-48000",
-        "grpo_ckpt": "/workspace/data/pinrec_ckpt_grpo_aggressive/checkpoint-10000",
-        "device": "cuda"
-    }
-}
-```
-
-#### 输出示例
-
-```
-🏆 终极对决结果 (N=500)
-============================================================
-Model    Hit@1   NDCG@1   Hit@5   NDCG@5   Hit@10  NDCG@10  Hit@20  NDCG@20
-HierGR   32.40%  0.3240   54.20%  0.4156   62.80%  0.4389   71.60%  0.4542
-PinRec   28.60%  0.2860   51.40%  0.3912   60.20%  0.4145   69.80%  0.4298
-============================================================
-```
-
-#### 关键技术点
-
-1. **Trie 树约束生成**（HierGR）
-   ```python
-   # 为每个城市构建 Trie 树
-   for city, strings in city_sid_strings.items():
-       trie = Trie()
-       tokens_list = tokenizer.encode_batch(strings)
-       for tokens in tokens_list:
-           trie.insert(tokens)
-       city_tries[city] = trie
-   ```
-
-2. **物理 Vocab Size 探测**（PinRec）
-   ```python
-   # 从权重文件中探测实际的 vocab size
-   state_dict = torch.load(item_path)
-   max_shape = max(v.shape[0] for k, v in state_dict.items() if v.dim() == 2)
-   physical_vocab_size = max_shape
-   ```
-
-3. **统一 Ground Truth 提取**
-   ```python
-   # 优先从 metadata.target_1.id 读取
-   if 'metadata' in sample and 'target_1' in sample['metadata']:
-       truth = sample['metadata']['target_1']['id']
-   # 回退到 Semantic ID 映射
-   elif 'target_sid' in sample['metadata']:
-       t_sid = parse_target_sid(sample['metadata']['target_sid'])
-       truth = sid_to_int[t_sid]
-   ```
-
----
-
-## 🔬 实验结果与分析
-
-### 消融实验（Ablation Study）
-
-| 模型变体 | Hit@10 | NDCG@10 | 平均距离 |
-|---------|--------|---------|---------|
-| **Baseline（无 RQ-VAE）** | 0.38 | 0.28 | 25 km |
-| **+ RQ-VAE（3层）** | 0.51 | 0.37 | 18 km |
-| **+ RQ-VAE（4层+Suffix）** | 0.57 | 0.40 | 18 km |
-| **+ 地理融合** | 0.60 | 0.42 | **11.2 km** |
-| **+ GRPO** | 0.61 | 0.43 | **11.2 km** |
-| **+ LogQ 修正** | 0.63 | 0.44 | 13.1 km |
-| **+ 约束生成** | **0.64** | **0.45** | 12.5 km |
-
-### 长尾物品性能
-
-| 物品流行度分组 | Hit@10（无 LogQ）| Hit@10（LogQ）| 提升 |
-|--------------|---------------|--------------|------|
-| **热门（Top 20%）** | 0.72 | 0.73 | +1.4% |
-| **中等（20%-60%）** | 0.58 | 0.61 | +5.2% |
-| **长尾（Bottom 40%）** | 0.42 | 0.52 | **+23.8%** |
-
-### 类别分布准确率
-
-| 商家类别 | Layer2 准确率 | Exact 准确率 |
-|---------|-------------|-------------|
-| **Restaurants** | 68% | 42% |
-| **Shopping** | 57% | 35% |
-| **Beauty & Spas** | 61% | 38% |
-| **Active Life** | 54% | 31% |
-| **Health & Medical** | 49% | 28% |
-| **Home Services** | 46% | 25% |
-
-### GRPO 收敛分析
-
-#### 奖励函数变化曲线
-```
-Epoch  | Format | Geo    | Semantic | Total
--------|--------|--------|----------|-------
-1      | 0.50   | 0.20   | 0.13     | 0.83
-2      | 0.50   | 0.28   | 0.15     | 0.93
-3      | 0.50   | 0.35   | 0.18     | 1.03
-4      | 0.50   | 0.39   | 0.20     | 1.09
-5      | 0.50   | 0.42   | 0.22     | 1.14
-8      | 0.50   | 0.44   | 0.24     | 1.18
-```
-
-**观察：**
-- Format Reward 始终保持 0.5（满分），说明 SFT 阶段已完全学会格式
-- Geo Reward 提升最显著（+120%），证明 GRPO 有效学习地理感知
-- Semantic Reward 稳步提升（+85%），层级语义理解逐步改善
-
----
-
-## ❓ 常见问题（FAQ）
-
-### Q1: 为什么需要 4 层语义 ID？3 层不够吗？
-**A**: 3 层 RQ-VAE 的 ID 冲突率高达 98.1%，即多个不同商家被映射到相同的 ID。添加第 4 层 Unique Suffix 后，冲突率降至 0%，确保每个商家都有唯一的标识。
-
-### Q2: HierGR 和 PinRec 有什么区别？
-**A**: 
-- **HierGR（生成式）**: 
-  - 基于 Qwen2.5-1.5B 的序列到序列模型
-  - 输出格式：`<c0, c1, c2, suffix>`
-  - 支持 Trie 树约束生成
-  - 适合需要可解释性的场景
-  
-- **PinRec（判别式）**: 
-  - 双塔检索模型（Item Tower + User Tower）
-  - 内容特征 + 哈希嵌入
-  - 训练速度快，推理效率高
-  - 适合大规模在线推荐
-
-推荐策略：
-- 如果需要可解释性和灵活性 → 使用 **HierGR**
-- 如果需要高效推理和大规模部署 → 使用 **PinRec**
-- 如果想要最佳性能 → 使用 **compare_models_unified.py** 对比两者
-
-### Q3: SFT 训练报错 `ValueError: model did not return a loss`
-**A**: 确保在 tokenization 时显式创建 `labels` 字段：
-```python
-def tokenize_function(examples):
-    model_inputs = tokenizer(examples["text"], truncation=True, max_length=512)
-    model_inputs["labels"] = model_inputs["input_ids"].copy()  # 关键
-    return model_inputs
-```
-
-### Q4: GRPO 训练不收敛怎么办？
-**A**: 检查以下几点：
-1. **SFT 是否训练充分**：运行 `check_sft_quality.py` 确认格式正确率 > 95%
-2. **奖励函数是否合理**：使用 `grpo_rewards_optimized.py` 而非 `grpo_rewards.py`
-3. **KL 惩罚是否过大**：尝试降低 `beta` 从 0.04 到 0.02
-4. **学习率是否过高**：GRPO 学习率应比 SFT 低 10倍（1e-6 vs 5e-5）
-
-### Q5: 如何可视化验证模型效果？
-**A**: 使用以下工具：
-```bash
-# 1. t-SNE 降维可视化 RQ-VAE 编码空间
-python inference/validate_grpo_with_tsne.py
-
-# 2. 绘制训练曲线
-python visualization/plot_training_curves.py
-
-# 3. 分析聚类纯度
-python inference/check_cluster_purity.py
-
-# 4. 错误案例分析
 python inference/analyze_errors.py
+python inference/validate_grpo_with_tsne.py
 ```
 
-### Q6: 生成的 ID 格式不对怎么办？
-**A**: 
-1. **检查 SFT 质量**：`python inference/check_sft_quality.py`
-2. **使用约束生成**：在推理时启用 `ConstrainedLogitsProcessor`
-3. **增加训练 epoch**：SFT 至少训练 3 个 epoch
+## 关键设计决策
 
-### Q7: 如何部署到生产环境？
-**A**: 
-1. **模型合并**：`python training/merge_model.py` 将 LoRA 合并到基座模型
-2. **模型量化**：使用 `bitsandbytes` 进行 INT8/INT4 量化
-3. **Batch Inference**：使用 `examples/batch_inference.py` 进行批量推理
-4. **API 封装**：参考 `inference/recommend.py` 实现 REST API
+### 1. 用层级语义 ID 替代原始 POI ID
 
-### Q8: 训练需要多少显存？
-**A**: 
-- **HierGR SFT（LoRA）**：16GB（batch_size=8）
-- **HierGR GRPO**：24GB（batch_size=4, num_generations=8）
-- **PinRec SFT**：12GB（batch_size=64）
-- **PinRec GRPO**：16GB（batch_size=32）
-- **Full Fine-tuning**：40GB+（不推荐）
+相比巨大的平铺 item vocabulary，语义 ID 让输出空间更结构化、更可压缩，也让模型可以做“部分正确”的层级判断：即使没有命中精确 POI，也可以在城市层、区域层或类别层上分析模型是否接近正确答案。
 
-显存优化建议：
-```python
-# 使用梯度累积
-gradient_accumulation_steps = 8  # 将实际 batch_size 增大 8 倍
+### 2. 提前融合文本与地理信息
 
-# 使用梯度检查点
-model.gradient_checkpointing_enable()
+当前配置和数据处理说明都明确将文本嵌入与经纬度特征在语义量化之前进行融合。对 Next-POI 任务来说，这是一个很关键的工程选择，因为地理位置不是附加元数据，而是问题本身的一部分。
 
-# 使用混合精度训练
-bf16 = True  # 推荐使用 bf16 而非 fp16
+### 3. 同时保留生成式与检索式两条路线
 
-# 减少生成候选数（GRPO）
-num_generations = 4  # 从 8 降到 4
-```
+项目没有只押注一种推荐范式，而是并行保留了生成式 LLM 路线和双塔排序路线。这让仓库更适合做实验、对照和调试，也更能体现建模判断力。
 
-### Q9: 如何处理冷启动问题？
-**A**: 
-1. **新用户**：使用基于内容的推荐（匹配用户画像与商家类别）
-2. **新商家**：使用基于地理位置的推荐（推荐同区域热门商家）
-3. **混合策略**：结合协同过滤和内容推荐的 Hybrid 模型
+### 4. 使用约束解码而不是完全放任自由生成
 
-### Q10: 如何进行超参数调优？
-**A**: 推荐调优顺序：
+仓库里有 Trie / constrained logits 相关逻辑，确保模型只生成合法的 cluster ID。这是一个非常实用的工程设计，能显著减少推理和评估阶段的无效输出。
 
-**HierGR（生成式）：**
-1. **SFT 学习率**：2e-5（推荐），范围 1e-5 ~ 5e-5
-2. **GRPO 学习率**：1e-6（推荐），范围 5e-7 ~ 5e-6
-3. **LoRA 秩 `r`**：64（推荐），范围 32-128
-4. **GRPO Beta**：0.04（推荐），范围 0.02-0.06
-5. **Beam Size**：10（推荐），范围 5-20
+### 5. 用奖励塑形替代过于稀疏的 RL 信号
 
-**PinRec（判别式）：**
-1. **学习率**：1e-4（推荐），范围 5e-5 ~ 2e-4
-2. **Batch Size**：64（推荐），越大越好
-3. **Lambda Pairwise**：0.5（推荐），范围 0.3-0.7
-4. **LogQ Alpha**：0.02（可选），范围 0.01-0.05
+GRPO 实验并不是只依赖单一的二值奖励，而是组合了格式正确性、语义对齐、地理接近度和命中行为等稠密奖励项。这比简单 sparse reward 更适合推荐场景下的强化学习优化。
 
-**通用建议：**
-- 先调 SFT，再调 GRPO
-- GRPO 学习率应比 SFT 小 10-20 倍
-- 使用 bf16 而非 fp16（更稳定）
-- 梯度累积可以模拟更大的 batch size
+## 如果在面试中讨论这个项目，我会重点讲什么
 
----
+如果把这个项目作为面试作品讨论，我会重点展开以下问题：
 
-## 📚 参考文献
+- 语义 ID 空间是如何构造的，为什么它对推荐有效；
+- 为什么仓库要同时维护 HierGR 与 PinRec / Ultimate 两条主线；
+- 约束生成如何影响最终评估质量；
+- GRPO 的奖励项是如何选择与权衡的；
+- 使用大量实验脚本和绝对路径配置带来了哪些工程代价；
+- 如果把它整理成更清晰的生产 / 研究双结构，我会如何重构。
 
-1. **GRPO**: [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models](https://arxiv.org/abs/2402.03300)
-2. **RQ-VAE**: [Residual Vector Quantization](https://arxiv.org/abs/2107.03312)
-3. **MiniOneRec**: [Towards Unified Generative Recommendation](https://github.com/example/MiniOneRec)
-4. **PinnerSage**: [PinnerSage: Multi-Modal User Embedding Framework for Recommendations at Pinterest](https://arxiv.org/abs/2007.03634)
-5. **LogQ**: [Sampled Softmax with Random Fourier Features](https://arxiv.org/abs/1908.10084)
-6. **Qwen2.5**: [Qwen2.5: A Party of Foundation Models](https://qwenlm.github.io/blog/qwen2.5/)
-7. **LoRA**: [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685)
-8. **Sinkhorn-Knopp**: [Sinkhorn Distances: Lightspeed Computation of Optimal Transport](https://arxiv.org/abs/1306.0895)
+## 取舍与局限
 
----
+- 这个仓库明显是一个持续演进中的研究工作区，因此存在大量版本化脚本（如 `v2`、`v3`、`v4`、`v5`、`final`、`debug`、`7B`），而不是单一整洁入口。
+- `run_pipeline.py` 适合帮助读者理解基础流程，但它并不能覆盖所有最新实验路径。
+- 当前配置大量使用 `/workspace/...` 绝对路径，因此本地复现前需要手动调整路径。
+- 完整复现依赖外部数据、本地 LLM checkpoint 以及若干处理后的中间产物，这些并未全部随仓库提供。
+- `requirements.txt` 更适合作为起点，而不是所有实验场景都可直接锁定复现的最终环境文件。
+- 仓库命名和模块命名体现了多个阶段的迭代（`SpaceTime-GR`、`HierGR-SeqRec`、`PinRec`、`Ultimate`、`Rank-GRPO`），后续若统一命名会更利于新读者理解。
 
-## 🤝 贡献指南
+## 下一步改进方向
 
-欢迎贡献代码、报告 Bug 或提出改进建议！
+如果继续完善这个项目，比较值得做的方向包括：
 
-### 贡献流程
-1. Fork 本项目
-2. 创建您的特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交您的修改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启一个 Pull Request
+1. 统一仓库命名与文档表述；
+2. 为其中一条主实验路线提供更干净的可复现配置；
+3. 更明确地区分“研究实验区”和“稳定流程区”；
+4. 提供环境文件或容器化配置；
+5. 补充一个可复现的 benchmark 表格；
+6. 暴露一条更清晰、面向评审者的一键 demo 路径。
 
-### 代码规范
-- 遵循 PEP 8 Python 代码风格
-- 添加必要的注释和文档字符串
-- 编写单元测试
-- 更新相关文档
+## 如何快速评估这个仓库
 
----
+- 想看**数据工程能力**：从 `data_processing/` 开始；
+- 想看**生成式推荐能力**：从 `training/train_sft_final.py` 和 `inference/recommend.py` 开始；
+- 想看**排序 / 检索能力**：从 `models/pinrec_ultimate_v2.py` 和 `training/train_pinrec_sft_final.py` 开始；
+- 想看**RL / 奖励塑形设计**：从 `training/train_grpo_v5.py`、`training/grpo_rewards_optimized.py` 和 `Rank-GRPO/` 开始；
+- 想看**评估成熟度**：从 `evaluation/evaluate_model.py` 和 `inference/validate_grpo_with_tsne.py` 开始。
 
-## 📄 许可证
+## 仓库内相关文档
 
-本项目基于 **MIT 许可证** 开源。详见 [LICENSE](LICENSE) 文件。
+- [`data_processing/README.md`](./data_processing/README.md)
+- [`training/GRPO_TRAINING_GUIDE.md`](./training/GRPO_TRAINING_GUIDE.md)
+- [`evaluation/README.md`](./evaluation/README.md)
+- [`evaluation/EVALUATION_GUIDE.md`](./evaluation/EVALUATION_GUIDE.md)
 
----
+## License
 
-## 📮 联系方式
-
-- **项目维护者**: [Your Name]
-- **Email**: your.email@example.com
-- **GitHub Issues**: [https://github.com/yourusername/HierGR-SeqRec/issues](https://github.com/yourusername/HierGR-SeqRec/issues)
-
----
-
-## 🎯 完整示例：从零到部署
-
-### 端到端训练流程
-
-```bash
-# 1. 数据处理（约 2 小时）
-python data_processing/step1_build_item_profile.py
-python data_processing/step2_generate_semantic_ids.py
-python data_processing/step3_build_user_sequences.py
-python data_processing/step4_construct_prompts.py
-
-# 2. HierGR 训练（约 8 小时）
-python training/train_sft_final.py  # SFT: 3 epochs
-python training/train_grpo_v3.py    # GRPO: 1000 steps
-
-# 3. PinRec 训练（约 6 小时）
-python training/train_pinrec_sft_final.py   # SFT: 20 epochs
-python training/train_pinrec_grpo_final.py  # GRPO: 5000 steps
-
-# 4. 统一评估（约 30 分钟）
-python compare_models_unified.py
-```
-
-### 快速测试（使用预训练模型）
-
-```bash
-# 1. 下载预训练模型（假设已上传到 Hugging Face）
-huggingface-cli download yourusername/hiergr-seqrec-yelp \
-    --local-dir ./pretrained_models
-
-# 2. 运行推理
-python inference/demo_inference.py \
-    --model_path ./pretrained_models/hiergr \
-    --input_file examples/user_history_example.json
-
-# 3. 查看结果
-cat output/recommendations.json
-```
-
-### 在线推荐 API
-
-```python
-from inference.recommend import HierGRRecommender
-
-# 初始化推荐器
-recommender = HierGRRecommender(
-    model_path="/workspace/data/grpo_v4_1_breadcrumbs/checkpoint-5000",
-    sid_mapping="/workspace/data/processed/sid_mapping.json"
-)
-
-# 推荐
-user_history = [
-    {"business_id": "abc123", "timestamp": 1234567890},
-    {"business_id": "def456", "timestamp": 1234567900}
-]
-
-recommendations = recommender.recommend(
-    user_history=user_history,
-    top_k=10,
-    use_constrained_generation=True
-)
-
-print(recommendations)
-# Output: [
-#   {"business_id": "xyz789", "score": 0.95, "semantic_id": "<3, 12, 45, 2>"},
-#   ...
-# ]
-```
-
----
-
-## 🙏 致谢
-
-- 感谢 [MiniOneRec](https://github.com/example/MiniOneRec) 提供的基础框架
-- 感谢 [Yelp Dataset](https://www.yelp.com/dataset) 提供的公开数据集
-- 感谢 [Hugging Face](https://huggingface.co/) 提供的 Transformers 库和预训练模型
-- 感谢 [Qwen Team](https://qwenlm.github.io/) 提供的优秀基座模型
-- 感谢所有开源社区的贡献者
-
----
-
-**最后更新**: 2024-12-13  
-**版本**: v2.1.0  
-**维护状态**: 🟢 活跃开发中
-
----
-
-## 💻 代码架构总结
-
-### 📦 核心模块组织
-
-#### 1. **数据处理流水线（data_processing/）**
-
-| 文件 | 功能 | 核心实现 |
-|------|------|---------|
-| `step1_build_item_profile.py` | 商家画像构建 | 聚合商家名称、类别、评论、地理位置信息 |
-| `step2_generate_semantic_ids.py` | RQ-VAE 训练与 SID 生成 | BERT 嵌入 + 地理坐标融合 → RQ-VAE 量化 |
-| `step3_build_user_sequences.py` | 用户序列构建 | 时间排序的交互历史 + K-core 过滤 |
-| `step4_construct_prompts.py` | 训练数据构造 | 多任务格式（序列推荐、下一个推荐、相似推荐） |
-| `balance_dataset.py` | 类别平衡采样 | 长尾类别上采样，确保训练数据分布均衡 |
-| `analyze_chain_stores.py` | 连锁店分析 | 识别连锁品牌，分析地理分布模式 |
-
-**关键技术点**：
-```python
-# step2_generate_semantic_ids.py - 地理坐标融合
-def fuse_embeddings_with_geo(embeddings, latitudes, longitudes):
-    """将 768d BERT 嵌入与 2d 地理坐标融合"""
-    scaler = MinMaxScaler()
-    geo_features = scaler.fit_transform(np.column_stack([latitudes, longitudes]))
-    fused = np.concatenate([embeddings, geo_features], axis=1)  # 770d
-    return fused
-
-# step4_construct_prompts.py - 多任务训练格式
-PROMPT_TEMPLATE = """User History:
-{history_items}
-
-Task: Recommend the next business for the user.
-Response: <{c0}, {c1}, {c2}, {suffix}>"""
-```
-
----
-
-#### 2. **RQ-VAE 核心实现（RQ-VAE/）**
-
-**模型架构（models/rqvae.py）**：
-```python
-class RQVAE(nn.Module):
-    def __init__(self, input_dim=770, hidden_dims=[768, 512, 256], num_layers=4):
-        # Encoder: 770d → 256d
-        self.encoder = Encoder(input_dim, hidden_dims)
-        
-        # 4-Layer Residual Quantization
-        self.quantizers = nn.ModuleList([
-            SinkhornKnoppQuantizer(codebook_size=256, num_codebooks=64)
-            for _ in range(num_layers)
-        ])
-        
-        # Decoder: 256d → 770d
-        self.decoder = Decoder(hidden_dims[::-1], input_dim)
-    
-    def forward(self, x):
-        z = self.encoder(x)  # 770d → 256d
-        
-        # 逐层残差量化
-        quantized = []
-        residual = z
-        for quantizer in self.quantizers:
-            q, indices = quantizer(residual)
-            quantized.append(q)
-            residual = residual - q  # 残差
-        
-        z_q = sum(quantized)  # 重建的量化向量
-        x_recon = self.decoder(z_q)
-        return x_recon, quantized, indices
-```
-
-**训练器（trainer.py）**：
-- **优化器**：Adam (lr=1e-4)
-- **损失函数**：MSE Reconstruction Loss + Commitment Loss
-- **早停机制**：1000 epochs 无改善自动停止
-- **检查点管理**：保存最佳重建损失和最低冲突率两个版本
-
-**Sinkhorn-Knopp 量化器（models/vq.py）**：
-```python
-class SinkhornKnoppQuantizer(nn.Module):
-    """防止 Codebook Collapse 的量化器"""
-    def forward(self, z):
-        # 计算距离矩阵
-        dist = torch.cdist(z, self.codebook)  # (B, N, K)
-        
-        # Sinkhorn-Knopp 算法优化分配
-        Q = sinkhorn_iteration(dist, num_iters=3)
-        
-        # 选择最佳 codebook
-        indices = Q.argmax(dim=-1)
-        quantized = self.codebook[indices]
-        return quantized, indices
-```
-
----
-
-#### 3. **训练脚本（training/）**
-
-##### **A. HierGR SFT 训练（train_sft_final.py）**
-
-**核心配置**：
-```python
-class SFTConfig:
-    base_model_path = "/workspace/Qwen2_5-1.5B-Instruct"
-    max_seq_length = 1024
-    
-    # LoRA 配置
-    lora_r = 128
-    lora_alpha = 256
-    lora_dropout = 0.05
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", 
-                      "gate_proj", "up_proj", "down_proj"]
-    
-    # 训练参数
-    learning_rate = 2e-4
-    num_train_epochs = 3
-    batch_size = 24
-    warmup_ratio = 0.03
-```
-
-**数据增强**：
-```python
-def augment_history(text):
-    """随机丢弃 1-2 个历史记录，防止过拟合"""
-    history_items = extract_history(text)
-    if len(history_items) > 5:
-        num_drop = random.randint(1, 2)
-        keep_items = random.sample(history_items, len(history_items) - num_drop)
-        return rebuild_prompt(keep_items)
-    return text
-```
-
-**关键特性**：
-- ✅ 动态历史增强（防止重复数据过拟合）
-- ✅ 使用平衡训练集 + 原始验证集
-- ✅ 自动 Checkpoint 管理（保留最新 2 个）
-- ✅ Cosine 学习率调度
-
----
-
-##### **B. HierGR GRPO 训练（train_grpo_v3.py）**
-
-**三维奖励函数**：
-```python
-def hierarchical_accuracy_reward_func(prompts, completions, target_sid, 
-                                     target_lat, target_lon, **kwargs):
-    """
-    Reward = Format Reward + Semantic Reward + Geo Reward
-    """
-    pred_id = parse_output(completion)  # 解析预测的 SID
-    
-    # 1. Format Reward (基础分)
-    if not pred_id:
-        return -2.0  # 格式错误重罚
-    score = 0.5
-    
-    # 2. Semantic Reward (层级递进)
-    if pred_id[0] == target_sid[0]:  # Layer 0 (Region)
-        score += 0.2
-        if pred_id[1] == target_sid[1]:  # Layer 1 (District)
-            score += 0.3
-            if pred_id[2] == target_sid[2]:  # Layer 2 (Category)
-                score += 1.0
-                if pred_id[3] == target_sid[3]:  # Exact Match
-                    score += 2.0
-    
-    # 3. Geo Reward (距离惩罚)
-    dist_km = haversine(pred_location, target_location)
-    if dist_km <= 1.0:
-        score += 0.5
-    elif dist_km <= 5.0:
-        score += 0.2
-    elif dist_km > 20.0:
-        score -= 0.1
-    
-    return score
-```
-
-**GRPO 配置**：
-```python
-grpo_config = GRPOConfig(
-    learning_rate=1e-6,  # 比 SFT 小 20 倍
-    num_train_epochs=3,
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=8,
-    
-    # GRPO 特定参数
-    num_sample_generations=4,  # 每个 prompt 生成 4 个候选
-    temperature=1.2,
-    max_new_tokens=32,
-    
-    # KL 散度控制
-    kl_coef=0.04,  # Beta 参数，防止偏离 reference model 过远
-)
-```
-
----
-
-##### **C. PinRec 训练（train_pinrec_sft_final.py & train_pinrec_grpo_final.py）**
-
-**模型架构（models/pinrec_ultimate_v2.py）**：
-```python
-class PinRecUltimateV2(nn.Module):
-    def __init__(self, config):
-        # Item Tower: Content + Hash Embedding
-        self.item_tower = ItemTower(config)
-        
-        # User Tower: LLM Backbone + Temporal Encoding
-        self.user_tower = UserTower(config)
-        
-    def forward(self, item_ids, history_ids, history_deltas):
-        # 1. Item Embeddings
-        item_embs = self.item_tower(item_ids)  # (B, N, 1024)
-        
-        # 2. User History Encoding
-        hist_embs = self.item_tower(history_ids)  # (B, H, 1024)
-        time_embs = self.time_encoder(history_deltas)  # (B, H, D)
-        
-        # 3. LLM Encoding
-        combined = torch.cat([hist_embs, time_embs], dim=-1)
-        user_emb = self.user_tower(combined)  # (B, 1024)
-        
-        # 4. Scoring
-        scores = torch.matmul(user_emb, item_embs.transpose(1, 2))
-        return scores
-```
-
-**损失函数**：
-```python
-def compute_loss(scores, positive_indices, negative_indices):
-    # 1. Classification Loss (Softmax)
-    loss_cls = F.cross_entropy(scores, positive_indices)
-    
-    # 2. Pairwise Ranking Loss
-    pos_scores = scores.gather(1, positive_indices.unsqueeze(1))
-    neg_scores = scores.gather(1, negative_indices.unsqueeze(1))
-    loss_pair = F.relu(0.2 - pos_scores + neg_scores).mean()
-    
-    # 3. LogQ Correction (可选)
-    if use_logq:
-        logq_weights = compute_logq_weights(positive_indices)
-        loss_cls = loss_cls * (1 + alpha * logq_weights)
-    
-    return loss_cls + lambda_pair * loss_pair
-```
-
-**关键优化**：
-- ✅ Hash Embedding 避免物品 ID 稀疏性
-- ✅ Time Delta Encoder 捕获时序模式
-- ✅ LogQ 采样偏差修正
-- ✅ LoRA 微调 User Tower 的 LLM Backbone
-
----
-
-#### 4. **评估系统（inference/ & compare_models_unified.py）**
-
-##### **统一对比框架（compare_models_unified.py）**
-
-**核心流程**：
-```python
-class ModelComparator:
-    def __init__(self, config):
-        # 1. 加载 HierGR (生成式)
-        self.hier_model = HierGRWrapper(config['hier'])
-        
-        # 2. 加载 PinRec (判别式)
-        self.pinrec_model = PinRecWrapper(config['pinrec'])
-        
-        # 3. 建立 ID 映射桥梁
-        self.id_mapper = IDMapper(
-            sid_mapping=config['sid_mapping'],
-            item_profiles=config['item_profiles']
-        )
-    
-    def evaluate(self, test_data, top_k_list):
-        results = {}
-        
-        for model_name, model in [('HierGR', self.hier_model), 
-                                   ('PinRec', self.pinrec_model)]:
-            predictions = []
-            ground_truths = []
-            
-            for sample in tqdm(test_data):
-                # 提取输入
-                prompt = sample['prompt']
-                target_string_id = sample['metadata']['target_1']['id']
-                
-                # 模型预测
-                pred_scores = model.predict(prompt, top_k=max(top_k_list))
-                
-                # ID 映射
-                pred_int_ids = [self.id_mapper.to_int(sid) for sid in pred_scores]
-                truth_int_id = self.id_mapper.to_int(target_string_id)
-                
-                predictions.append(pred_int_ids)
-                ground_truths.append(truth_int_id)
-            
-            # 计算指标
-            results[model_name] = compute_metrics(
-                predictions, ground_truths, top_k_list
-            )
-        
-        return results
-```
-
-**HierGR Wrapper（约束生成）**：
-```python
-class HierGRWrapper:
-    def predict(self, prompt, top_k):
-        # 提取城市信息
-        city = extract_city_from_prompt(prompt)
-        
-        # 加载对应城市的 Trie 树
-        trie = self.city_tries[city]
-        
-        # 约束生成
-        logits_processor = TrieConstraintLogitsProcessor(
-            prompt_length=len(self.tokenizer.encode(prompt)),
-            trie=trie
-        )
-        
-        # Beam Search
-        outputs = self.model.generate(
-            input_ids=input_ids,
-            max_new_tokens=32,
-            num_beams=self.beams,
-            num_return_sequences=top_k,
-            logits_processor=[logits_processor]
-        )
-        
-        # 解析 SID
-        predictions = [parse_sid(o) for o in outputs]
-        return predictions
-```
-
-**指标计算**：
-```python
-def compute_metrics(predictions, ground_truths, top_k_list):
-    metrics = {}
-    
-    for k in top_k_list:
-        # Hit@K
-        hits = [1 if truth in pred[:k] else 0 
-                for pred, truth in zip(predictions, ground_truths)]
-        metrics[f'Hit@{k}'] = np.mean(hits)
-        
-        # NDCG@K
-        ndcgs = []
-        for pred, truth in zip(predictions, ground_truths):
-            if truth in pred[:k]:
-                rank = pred[:k].index(truth) + 1
-                ndcgs.append(1.0 / np.log2(rank + 1))
-            else:
-                ndcgs.append(0.0)
-        metrics[f'NDCG@{k}'] = np.mean(ndcgs)
-    
-    return metrics
-```
-
----
-
-#### 5. **可视化工具（visualization/）**
-
-##### **Codebook 可视化（visualize_codebook.py）**
-
-```python
-def visualize_codebook_distribution(rqvae_model, sid_mapping):
-    """可视化 RQ-VAE Codebook 的地理分布和类别分布"""
-    
-    # 1. 提取所有 SID 的 Codebook Indices
-    codebook_usage = {layer: Counter() for layer in range(4)}
-    
-    for business_id, meta in sid_mapping.items():
-        sid = meta['full_sid']
-        for layer, code in enumerate(sid):
-            codebook_usage[layer][code] += 1
-    
-    # 2. t-SNE 降维可视化
-    layer0_vectors = rqvae_model.quantizers[0].codebook.weight.detach().cpu()
-    tsne = TSNE(n_components=2)
-    layer0_2d = tsne.fit_transform(layer0_vectors.numpy())
-    
-    # 3. 按城市着色
-    plt.figure(figsize=(12, 8))
-    for city in unique_cities:
-        city_codes = get_city_codes(sid_mapping, city, layer=0)
-        plt.scatter(layer0_2d[city_codes, 0], 
-                   layer0_2d[city_codes, 1], 
-                   label=city, alpha=0.6)
-    plt.legend()
-    plt.title('Layer 0 Codebook Distribution by City')
-    plt.savefig('layer0_city_distribution.png')
-```
-
----
-
-### 🔧 关键技术实现细节
-
-#### **1. ID 冲突解决机制**
-
-**问题**：3 层 RQ-VAE 产生 98.1% 的 ID 冲突
-
-**解决方案（step2_generate_semantic_ids.py）**：
-```python
-def resolve_collisions(sid_mapping):
-    """添加第 4 层 Unique Suffix 消除冲突"""
-    
-    # 统计每个 Layer2 ID 的冲突数
-    layer2_counter = Counter()
-    for meta in sid_mapping.values():
-        layer2_id = tuple(meta['full_sid'][:3])
-        layer2_counter[layer2_id] += 1
-    
-    # 为冲突 ID 分配 Suffix
-    suffix_map = defaultdict(int)
-    for business_id, meta in sid_mapping.items():
-        layer2_id = tuple(meta['full_sid'][:3])
-        if layer2_counter[layer2_id] > 1:
-            suffix = suffix_map[layer2_id]
-            suffix_map[layer2_id] += 1
-        else:
-            suffix = 0
-        
-        # 更新 full_sid
-        meta['full_sid'] = list(meta['full_sid'][:3]) + [suffix]
-    
-    return sid_mapping
-```
-
-**结果**：冲突率降至 0.0%
-
----
-
-#### **2. Trie 树约束生成**
-
-**构建 Trie 树（inference/trie_utils.py）**：
-```python
-class Trie:
-    def __init__(self):
-        self.root = {}
-    
-    def insert(self, token_sequence):
-        """插入一个有效的 SID token 序列"""
-        node = self.root
-        for token in token_sequence:
-            if token not in node:
-                node[token] = {}
-            node = node[token]
-        node[-1] = True  # 标记结束
-    
-    def get_next_tokens(self, prefix):
-        """获取给定前缀的所有有效下一个 token"""
-        node = self.root
-        for token in prefix:
-            if token not in node:
-                return None  # 无效前缀
-            node = node[token]
-        return [k for k in node.keys() if k != -1]
-```
-
-**Logits Processor（training/constrained_logits_processor.py）**：
-```python
-class TrieConstraintLogitsProcessor(LogitsProcessor):
-    def __call__(self, input_ids, scores):
-        for i in range(input_ids.shape[0]):
-            # 获取已生成的 token
-            generated = input_ids[i, self.prompt_length:].tolist()
-            
-            # 查询允许的下一个 token
-            allowed = self.trie.get_next_tokens(generated)
-            
-            if allowed is not None:
-                # 屏蔽无效 token
-                mask = torch.ones_like(scores[i], dtype=torch.bool)
-                mask[allowed] = False
-                scores[i] = scores[i].masked_fill(mask, -float('inf'))
-        
-        return scores
-```
-
----
-
-#### **3. LogQ 采样偏差修正**
-
-**实现（training/train_pinrec_v7_final.py）**：
-```python
-def compute_logq_weights(item_ids, item_frequencies):
-    """
-    LogQ 修正公式：
-    weight_i = log(P(item_i)) / sum_j log(P(item_j))
-    
-    用于调整损失函数，减少对热门物品的过度关注
-    """
-    # 1. 获取物品频率
-    freqs = torch.tensor([item_frequencies.get(i, 1) for i in item_ids])
-    
-    # 2. 计算 log 概率
-    log_probs = torch.log(freqs.float() + 1e-9)
-    
-    # 3. 归一化到 [-1, 0] 区间
-    min_lp = log_probs.min()
-    max_lp = log_probs.max()
-    normalized = (log_probs - min_lp) / (max_lp - min_lp + 1e-9) - 1
-    
-    return normalized
-
-# 应用到损失函数
-loss = classification_loss * (1 + alpha * logq_weights)
-```
-
-**效果**：长尾物品 Hit@10 提升 23.8%
-
----
-
-### 📊 代码质量与工程实践
-
-#### **1. 配置管理**
-
-所有训练脚本使用统一的配置类：
-```python
-# config/config.yaml
-data:
-  processed_dir: "/workspace/data/processed"
-  max_history_len: 40
-
-rqvae:
-  num_layers: 4
-  codebook_size: 256
-
-llm:
-  model_name: "/workspace/Qwen2_5-1.5B-Instruct"
-  learning_rate: 2e-4
-```
-
-#### **2. 日志与监控**
-
-```python
-# 统一的日志配置
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-# 训练过程监控
-for epoch in range(num_epochs):
-    logger.info(f"Epoch {epoch+1}/{num_epochs}")
-    logger.info(f"Loss: {loss:.4f}, Hit@10: {hit10:.4f}")
-    
-    # 自动保存最佳 Checkpoint
-    if hit10 > best_hit10:
-        save_checkpoint(model, f"best_model_epoch{epoch}.pth")
-```
-
-#### **3. 内存管理**
-
-```python
-# 梯度检查点（节省显存）
-model.gradient_checkpointing_enable()
-
-# 混合精度训练
-with autocast(dtype=torch.bfloat16):
-    outputs = model(inputs)
-    loss = criterion(outputs, targets)
-
-# 及时释放缓存
-del intermediate_tensors
-torch.cuda.empty_cache()
-```
-
-#### **4. 错误处理**
-
-```python
-try:
-    predictions = model.generate(prompt)
-except RuntimeError as e:
-    if "out of memory" in str(e):
-        logger.warning("OOM detected, reducing batch size")
-        torch.cuda.empty_cache()
-        # 降低 batch size 重试
-    else:
-        raise e
-```
-
----
-
-### 🚀 性能优化技巧
-
-#### **1. 数据加载优化**
-
-```python
-# 多进程数据加载
-train_loader = DataLoader(
-    dataset, 
-    batch_size=64, 
-    num_workers=4,  # 并行加载
-    pin_memory=True  # 加速 CPU->GPU 传输
-)
-```
-
-#### **2. 模型并行**
-
-```python
-# DeepSpeed 集成
-from deepspeed import initialize
-
-model, optimizer, _, _ = initialize(
-    model=model,
-    model_parameters=model.parameters(),
-    config="deepspeed_config.json"
-)
-```
-
-#### **3. 推理加速**
-
-```python
-# KV Cache 复用
-with torch.inference_mode():
-    outputs = model.generate(
-        input_ids,
-        use_cache=True,  # 复用 Key-Value Cache
-        num_beams=10
-    )
-```
-
----
-
-### 📈 代码行数统计
-
-| 模块 | 文件数 | 代码行数 | 功能占比 |
-|------|--------|---------|---------|
-| **data_processing/** | 12 | ~3,500 | 数据处理流水线 |
-| **training/** | 32 | ~8,000 | 训练脚本（SFT + GRPO） |
-| **models/** | 4 | ~1,200 | 模型定义（PinRec + RQ-VAE） |
-| **inference/** | 33 | ~6,500 | 评估与推理工具 |
-| **RQ-VAE/** | 6 | ~2,000 | RQ-VAE 核心实现 |
-| **evaluation/** | 7 | ~1,800 | 评估指标与工具 |
-| **visualization/** | 4 | ~800 | 可视化脚本 |
-| **总计** | **98** | **~24,000** | - |
-
----
-
-### 🔑 核心代码路径速查
-
-| 功能 | 文件路径 | 说明 |
-|------|---------|------|
-| **RQ-VAE 模型** | `RQ-VAE/models/rqvae.py` | 4 层残差量化 VAE |
-| **SFT 训练** | `training/train_sft_final.py` | HierGR 监督微调 |
-| **GRPO 训练** | `training/train_grpo_v3.py` | 三维奖励函数 RL |
-| **PinRec 模型** | `models/pinrec_ultimate_v2.py` | 双塔判别式推荐 |
-| **统一评估** | `compare_models_unified.py` | HierGR vs PinRec 对比 |
-| **约束生成** | `training/constrained_logits_processor.py` | Trie 树约束 Logits |
-| **语义 ID 生成** | `data_processing/step2_generate_semantic_ids.py` | BERT + Geo + RQ-VAE |
-| **奖励函数** | `training/grpo_rewards_v3.py` | Format + Geo + Semantic |
-
----
-
-## 🆕 更新日志
-
-### v2.1.0 (2024-12-13)
-- ✨ 新增统一评估框架 `compare_models_unified.py`
-- 🔧 修复 GRPO V3 训练脚本的 LoRA 配置问题
-- 📊 优化 ID 映射逻辑（String ID ↔ Integer ID）
-- 🎯 改进 Trie 树约束生成机制
-- 📝 更新 README 文档，反映最新代码结构
-
-### v2.0.0 (2024-12-12)
-- 🚀 实现 HierGR（生成式）和 PinRec（判别式）双模型架构
-- 🎓 完成 SFT + GRPO 两阶段训练流程
-- 🌍 集成地理感知推荐（770d 输入）
-- 🔍 添加 Codebook 可视化工具
-- 📚 完善 GRPO 训练指南
-
----
-
-## ⭐ Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=yourusername/HierGR-SeqRec&type=Date)](https://star-history.com/#yourusername/HierGR-SeqRec&Date)
-
+当前顶层目录中没有看到明确的 `LICENSE` 文件。如果你希望这个项目的使用范围和授权方式更清晰，建议补充一个顶层 `LICENSE`。
