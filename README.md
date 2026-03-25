@@ -39,6 +39,9 @@
 - **研究工程习惯**：保留多版本实验脚本、ablation 风格分支、调试工具和独立说明文档。
 
 ## 核心思路
+下图展示了 SpaceTime-GR 的整体模型结构与数据流：
+
+![SpaceTime-GR model architecture](model_architecture.png)
 
 ```text
 Yelp 商家数据 + 评论数据
