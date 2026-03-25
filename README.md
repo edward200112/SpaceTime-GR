@@ -41,7 +41,7 @@
 ## 核心思路
 下图展示了 SpaceTime-GR 的整体模型结构与数据流：
 
-![SpaceTime-GR model architecture](./model_architecture.png)
+![SpaceTime-GR model architecture](overall.png)
 
 ```text
 Yelp 商家数据 + 评论数据
