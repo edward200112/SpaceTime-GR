@@ -379,6 +379,10 @@ python inference/validate_grpo_with_tsne.py
 
 
 > 说明：下表汇总了部分核心实验阶段性结果。除特别说明外，指标均来自离线评估；其中部分 GRPO 结果明确标注了 `N=500`。这些结果的重点不在于“是否已经超过工业级排序模型”，而在于：**LLM 可以稳定学习地理约束，并开始学习层级语义 ID 的类别结构**。
+对于 Yelp18 数据集，其他基于 DLRM 的方法结果可参考以下公开榜单：
+https://openbenchmark.github.io/BARS/Matching/leaderboard/yelp18_m1.html
+需要说明的是，本文采用的是**生成式推荐（generative recommendation）**范式，与上述传统 DLRM 方法存在一定差异。截止目前，我们暂未检索到在 Yelp18 数据集上与本文设定完全一致的相似论文结果，因此暂时无法进行严格的同口径对比。
+
 
 | 实验版本 | 关键改动 | Mean Distance ↓ | Hit@1 ↑ | Hit@5 ↑ | Hit@10 ↑ | Layer 0（City）↑ | Layer 1（District）↑ | Layer 2（Category）↑ | Layer 3 / Exact ↑ | 结论 |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
